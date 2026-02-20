@@ -6,7 +6,7 @@ phases:
       python: 3.10
   build:
     commands:
-      - echo "TESTING AUTOMATIC UPDATE #2 - IT WORKS!"
+      - echo "Automation is finally working!"
       - aws cloudformation package --template-file PDFtoTXT/PDFtoTXT/pdftotxt.yaml --s3-bucket search-artifacts-store --output-template-file lambdaoutput.yaml
 
 artifacts:
