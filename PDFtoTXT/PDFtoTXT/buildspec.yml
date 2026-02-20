@@ -1,13 +1,12 @@
 version: 0.2
 
-echo "TESTING AUTOMATIC UPDATE #2 - IT WORKS!"
-
 phases:
   install:
     runtime-versions:
       python: 3.10
   build:
     commands:
+      - echo "TESTING AUTOMATIC UPDATE #2 - IT WORKS!"
       - echo "Starting the build..."
       - aws cloudformation package --template-file PDFtoTXT/PDFtoTXT/pdftotxt.yaml --s3-bucket search-artifacts-store --output-template-file lambdaoutput.yaml
 
