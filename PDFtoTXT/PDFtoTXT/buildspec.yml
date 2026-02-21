@@ -1,29 +1,15 @@
-AWSTemplateFormatVersion: '2010-09-09'
-Transform: AWS::Serverless-2016-10-31
-Description: Lambda function to convert PDF to TXT triggered by S3.
+version: 0.2
 
-Resources:
-  PDFToTextFunction:
-    Type: AWS::Serverless::Function
-    Properties:
-      Handler: lambda_function.lambda_handler
-      Runtime: python3.10
-      CodeUri: .
-      MemorySize: 512
-      Timeout: 30
-      Events:
-        S3Event:
-          Type: S3
-          Properties:
-            Bucket: !Ref SourceBucket
-            Events: s3:ObjectCreated:*
+phases:
+  install:
+    runtime-versions:
+      python: 3.10
+  build:
+    commands:
+      - echo "Packaging the project..."
+      - aws cloudformation package --template-file PDFtoTXT/PDFtoTXT/pdftotxt.yaml --s3-bucket search-artifacts-store --output-template-file lambdaoutput.yaml
 
-  SourceBucket:
-    Type: AWS::S3::Bucket
-    Properties:
-      BucketName: search-pdf-store
-
-Outputs:
-  LambdaFunctionArn:
-    Description: "PDF to TXT Lambda Function ARN"
-    Value: !GetAtt PDFToTextFunction.Arn
+artifacts:
+  files:
+    - lambdaoutput.yaml
+    - PDFtoTXT/PDFtoTXT/pdftotxt.yaml
