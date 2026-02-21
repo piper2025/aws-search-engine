@@ -12,7 +12,7 @@ phases:
       # This line removes the hidden characters that break CloudFormation
       - sed '1s/^\xef\xbb\xbf//' temp.yaml > lambdaoutput.yaml
 
-post_build:
+   post_build:
     commands:
       - echo "Deploying updated Lambda..."
       - aws cloudformation package --template-file template.yaml --s3-bucket search-artifacts-store --output-template-file packaged.yaml
