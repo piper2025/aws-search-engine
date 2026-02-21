@@ -4,6 +4,10 @@ phases:
   install:
     runtime-versions:
       python: 3.10
+    commands:
+      - echo "Installing dependencies..."
+      # This installs pypdf directly into your current folder so it gets zipped up
+      - pip install pypdf -t .
   build:
     commands:
       - echo "Starting clean package..."
