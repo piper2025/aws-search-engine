@@ -6,18 +6,16 @@ phases:
       python: 3.10
     commands:
       - echo "Installing dependencies..."
-      # This installs pypdf directly into your current folder so it gets zipped up
-      - pip install pypdf -t .
+      # Install to a subfolder first to ensure we get everything
+      - pip install pypdf -t lib/
   build:
     commands:
-      - echo "Starting clean package..."
+      - echo "Preparing package..."
+      # Copy the libraries from the lib folder to the root where lambda_function.py lives
+      - cp -r lib/* .
       - aws cloudformation package --template-file PDFtoTXT/PDFtoTXT/pdftotxt.yaml --s3-bucket search-artifacts-store --output-template-file temp.yaml
       - sed '1s/^\xef\xbb\xbf//' temp.yaml > lambdaoutput.yaml
   post_build:
     commands:
       - echo "Deploying updated Lambda..."
       - aws cloudformation deploy --template-file lambdaoutput.yaml --stack-name pdf-automation-v1 --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM --no-fail-on-empty-changeset
-artifacts:
-  files:
-    - lambdaoutput.yaml
-    - PDFtoTXT/PDFtoTXT/pdftotxt.yaml
