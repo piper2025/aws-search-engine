@@ -5,17 +5,15 @@ phases:
     runtime-versions:
       python: 3.10
     commands:
-      - echo "Cleaning old local libraries..."
-      # This ensures we don't zip up broken or wrong-version local files
-      - rm -rf pypdf typing_extensions
-      - echo "Installing fresh dependencies..."
-      - pip install pypdf -t .
+      - echo "Installing dependencies directly into the source folder..."
+      # Install directly into the folder CloudFormation will zip
+      - pip install pypdf typing_extensions -t PDFtoTXT/PDFtoTXT/
   build:
     commands:
       - echo "Packaging infrastructure..."
-      - aws cloudformation package --template-file PDFtoTXT/PDFtoTXT/pdftotxt.yaml --s3-bucket search-artifacts-store --output-template-file temp.yaml
-      - sed '1s/^\xef\xbb\xbf//' temp.yaml > lambdaoutput.yaml
+      # This command zips everything inside PDFtoTXT/PDFtoTXT/
+      - aws cloudformation package --template-file PDFtoTXT/PDFtoTXT/pdftotxt.yaml --s3-bucket search-artifacts-store --output-template-file lambdaoutput.yaml
   post_build:
     commands:
-      - echo "Deploying to AWS..."
+      - echo "Deploying..."
       - aws cloudformation deploy --template-file lambdaoutput.yaml --stack-name pdf-automation-v1 --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM --no-fail-on-empty-changeset
