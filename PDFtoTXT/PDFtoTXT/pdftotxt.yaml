@@ -1,19 +1,21 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: 'AWS::Serverless-2016-10-31'
-Description: An AWS Serverless Specification template describing your function.
+Description: Automated PDF to Text Converter for us-east-1.
+
 Resources:
   pdftotxt:
     Type: 'AWS::Serverless::Function'
     Properties:
+      # Use a unique name to avoid conflicts with manual functions
+      FunctionName: PDFToText-Automated
       Handler: lambda_function.lambda_handler
-      Runtime: python3.7
+      Runtime: python3.10
       CodeUri: .
-      Description: ''
+      Description: 'Extracts text from PDFs automatically via CI/CD'
       MemorySize: 512
       Timeout: 900
-      Role: 'arn:aws:iam::844028273225:role/lambda_s3'
+      # Updated to your actual role ARN from previous steps
+      Role: 'arn:aws:iam::779803046124:role/lambda_s3'
       Environment:
         Variables:
-          TARGET_BUCKET: gl-inter-store
-      Layers:
-        - 'arn:aws:lambda:ap-northeast-1:844028273225:layer:tika:1'
+          TARGET_BUCKET: gl-inter-store-2026
