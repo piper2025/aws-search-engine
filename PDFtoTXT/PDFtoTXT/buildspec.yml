@@ -6,8 +6,9 @@ phases:
       python: 3.10
   build:
     commands:
-      - echo "Packaging the project..."
-      - aws cloudformation package --template-file PDFtoTXT/PDFtoTXT/pdftotxt.yaml --s3-bucket search-artifacts-store --output-template-file lambdaoutput.yaml
+      - echo "Starting clean package..."
+      - aws cloudformation package --template-file PDFtoTXT/PDFtoTXT/pdftotxt.yaml --s3-bucket search-artifacts-store --output-template-file temp.yaml
+      - sed '1s/^\xef\xbb\xbf//' temp.yaml > lambdaoutput.yaml
 
 artifacts:
   files:
