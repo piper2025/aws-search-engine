@@ -17,4 +17,4 @@ Resources:
       Environment:
         Variables:
           TARGET_BUCKET: gl-inter-store-2026
-          DEPLOY_TIMESTAMP: "2026-02-21-v3" # Change this slightly every time you push to force an update
+          DEPLOY_TIMESTAMP: "2026-02-21-v4" # Change this slightly every time you push to force an update
