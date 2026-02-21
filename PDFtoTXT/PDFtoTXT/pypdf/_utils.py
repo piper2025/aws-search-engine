@@ -31,28 +31,32 @@ __author_email__ = "biziqe@mathieu.fenniak.net"
 
 import functools
 import logging
+import re
+import sys
 import warnings
-from codecs import getencoder
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from io import DEFAULT_BUFFER_SIZE
 from os import SEEK_CUR
+from re import Pattern
 from typing import (
     IO,
     Any,
-    Callable,
-    Dict,
     Optional,
-    Pattern,
-    Tuple,
     Union,
     overload,
 )
 
-try:
+if sys.version_info[:2] >= (3, 10):
     # Python 3.10+: https://www.python.org/dev/peps/pep-0484/
-    from typing import TypeAlias  # type: ignore[attr-defined]
-except ImportError:
+    from typing import TypeAlias
+else:
     from typing_extensions import TypeAlias
+
+if sys.version_info >= (3, 11):
+    from typing import Self
+else:
+    from typing_extensions import Self
 
 from .errors import (
     STREAM_TRUNCATED_PREMATURELY,
@@ -60,30 +64,82 @@ from .errors import (
     PdfStreamError,
 )
 
-TransformationMatrixType: TypeAlias = Tuple[
-    Tuple[float, float, float], Tuple[float, float, float], Tuple[float, float, float]
+TransformationMatrixType: TypeAlias = tuple[
+    tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]
 ]
-CompressedTransformationMatrix: TypeAlias = Tuple[
+CompressedTransformationMatrix: TypeAlias = tuple[
     float, float, float, float, float, float
 ]
 
-StreamType = IO
+StreamType = IO[Any]
 StrByteType = Union[str, StreamType]
 
-DEPR_MSG_NO_REPLACEMENT = "{} is deprecated and will be removed in pypdf {}."
-DEPR_MSG_NO_REPLACEMENT_HAPPENED = "{} is deprecated and was removed in pypdf {}."
-DEPR_MSG = "{} is deprecated and will be removed in pypdf 3.0.0. Use {} instead."
-DEPR_MSG_HAPPENED = "{} is deprecated and was removed in pypdf {}. Use {} instead."
+
+def parse_iso8824_date(text: Optional[str]) -> Optional[datetime]:
+    orgtext = text
+    if not text:
+        return None
+    if text[0].isdigit():
+        text = "D:" + text
+    if text.endswith(("Z", "z")):
+        text += "0000"
+    text = text.replace("z", "+").replace("Z", "+").replace("'", "")
+    i = max(text.find("+"), text.find("-"))
+    if i > 0 and i != len(text) - 5:
+        text += "00"
+    for f in (
+        "D:%Y",
+        "D:%Y%m",
+        "D:%Y%m%d",
+        "D:%Y%m%d%H",
+        "D:%Y%m%d%H%M",
+        "D:%Y%m%d%H%M%S",
+        "D:%Y%m%d%H%M%S%z",
+    ):
+        try:
+            d = datetime.strptime(text, f)  # noqa: DTZ007
+        except ValueError:
+            continue
+        else:
+            if text.endswith("+0000"):
+                d = d.replace(tzinfo=timezone.utc)
+            return d
+    raise ValueError(f"Can not convert date: {orgtext}")
 
 
-def _get_max_pdf_version_header(header1: bytes, header2: bytes) -> bytes:
+def format_iso8824_date(dt: datetime) -> str:
+    """
+    Convert a datetime object to PDF date string format.
+
+    Converts datetime to the PDF date format D:YYYYMMDDHHmmSSOHH'mm
+    as specified in the PDF Reference.
+
+    Args:
+        dt: A datetime object to convert.
+
+    Returns:
+        A date string in PDF format.
+    """
+    date_str = dt.strftime("D:%Y%m%d%H%M%S")
+    if dt.tzinfo is not None:
+        offset = dt.utcoffset()
+        assert offset is not None
+        total_seconds = int(offset.total_seconds())
+        hours, remainder = divmod(abs(total_seconds), 3600)
+        minutes = remainder // 60
+        sign = "+" if total_seconds >= 0 else "-"
+        date_str += f"{sign}{hours:02d}'{minutes:02d}'"
+    return date_str
+
+
+def _get_max_pdf_version_header(header1: str, header2: str) -> str:
     versions = (
-        b"%PDF-1.3",
-        b"%PDF-1.4",
-        b"%PDF-1.5",
-        b"%PDF-1.6",
-        b"%PDF-1.7",
-        b"%PDF-2.0",
+        "%PDF-1.3",
+        "%PDF-1.4",
+        "%PDF-1.5",
+        "%PDF-1.6",
+        "%PDF-1.7",
+        "%PDF-2.0",
     )
     pdf_header_indices = []
     if header1 in versions:
@@ -91,8 +147,13 @@ def _get_max_pdf_version_header(header1: bytes, header2: bytes) -> bytes:
     if header2 in versions:
         pdf_header_indices.append(versions.index(header2))
     if len(pdf_header_indices) == 0:
-        raise ValueError(f"neither {header1!r} nor {header2!r} are proper headers")
+        raise ValueError(f"Neither {header1!r} nor {header2!r} are proper headers")
     return versions[max(pdf_header_indices)]
+
+
+WHITESPACES = (b"\x00", b"\t", b"\n", b"\f", b"\r", b" ")
+WHITESPACES_AS_BYTES = b"".join(WHITESPACES)
+WHITESPACES_AS_REGEXP = b"[" + WHITESPACES_AS_BYTES + b"]"
 
 
 def read_until_whitespace(stream: StreamType, maxchars: Optional[int] = None) -> bytes:
@@ -102,11 +163,12 @@ def read_until_whitespace(stream: StreamType, maxchars: Optional[int] = None) ->
     Stops upon encountering whitespace or when maxchars is reached.
 
     Args:
-      stream: The data stream from which was read.
-      maxchars: The maximum number of bytes returned; by default unlimited.
+        stream: The data stream from which was read.
+        maxchars: The maximum number of bytes returned; by default unlimited.
 
     Returns:
-      The data which was read.
+        The data which was read.
+
     """
     txt = b""
     while True:
@@ -124,10 +186,11 @@ def read_non_whitespace(stream: StreamType) -> bytes:
     Find and read the next non-whitespace character (ignores whitespace).
 
     Args:
-      stream: The data stream from which was read.
+        stream: The data stream from which was read.
 
     Returns:
-      The data which was read.
+        The data which was read.
+
     """
     tok = stream.read(1)
     while tok in WHITESPACES:
@@ -137,22 +200,36 @@ def read_non_whitespace(stream: StreamType) -> bytes:
 
 def skip_over_whitespace(stream: StreamType) -> bool:
     """
-    Similar to read_non_whitespace, but return a boolean if more than
-    one whitespace character was read.
+    Similar to read_non_whitespace, but return a boolean if at least one
+    whitespace character was read.
 
     Args:
-      stream: The data stream from which was read.
+        stream: The data stream from which was read.
 
     Returns:
-      True if more than one whitespace was skipped,
-      otherwise return False.
+        True if one or more whitespace was skipped, otherwise return False.
+
     """
-    tok = WHITESPACES[0]
+    tok = stream.read(1)
     cnt = 0
     while tok in WHITESPACES:
-        tok = stream.read(1)
         cnt += 1
-    return cnt > 1
+        tok = stream.read(1)
+    return cnt > 0
+
+
+def check_if_whitespace_only(value: bytes) -> bool:
+    """
+    Check if the given value consists of whitespace characters only.
+
+    Args:
+        value: The bytes to check.
+
+    Returns:
+        True if the value only has whitespace characters, otherwise return False.
+
+    """
+    return all(b in WHITESPACES_AS_BYTES for b in value)
 
 
 def skip_over_comment(stream: StreamType) -> None:
@@ -161,6 +238,8 @@ def skip_over_comment(stream: StreamType) -> None:
     if tok == b"%":
         while tok not in (b"\n", b"\r"):
             tok = stream.read(1)
+            if tok == b"":
+                raise PdfStreamError("File ended unexpectedly.")
 
 
 def read_until_regex(stream: StreamType, regex: Pattern[bytes]) -> bytes:
@@ -169,20 +248,21 @@ def read_until_regex(stream: StreamType, regex: Pattern[bytes]) -> bytes:
     Treats EOF on the underlying stream as the end of the token to be matched.
 
     Args:
-      regex: re.Pattern
+        regex: re.Pattern
 
     Returns:
-      The read bytes.
+        The read bytes.
+
     """
     name = b""
     while True:
         tok = stream.read(16)
         if not tok:
             return name
-        m = regex.search(tok)
+        m = regex.search(name + tok)
         if m is not None:
-            name += tok[: m.start()]
-            stream.seek(m.start() - len(tok), 1)
+            stream.seek(m.start() - (len(name) + len(tok)), 1)
+            name = (name + tok)[: m.start()]
             break
         name += tok
     return name
@@ -196,11 +276,12 @@ def read_block_backwards(stream: StreamType, to_read: int) -> bytes:
     read.
 
     Args:
-      stream:
-      to_read:
+        stream:
+        to_read:
 
     Returns:
-      The data which was read.
+        The data which was read.
+
     """
     if stream.tell() < to_read:
         raise PdfStreamError("Could not read malformed PDF file")
@@ -223,10 +304,11 @@ def read_previous_line(stream: StreamType) -> bytes:
     or, if no such byte is found, at the beginning of the stream.
 
     Args:
-      stream: StreamType:
+        stream: StreamType:
 
     Returns:
-      The data which was read.
+        The data which was read.
+
     """
     line_content = []
     found_crlf = False
@@ -290,44 +372,6 @@ def mark_location(stream: StreamType) -> None:
     stream.seek(-radius, 1)
 
 
-B_CACHE: Dict[Union[str, bytes], bytes] = {}
-
-
-def b_(s: Union[str, bytes]) -> bytes:
-    bc = B_CACHE
-    if s in bc:
-        return bc[s]
-    if isinstance(s, bytes):
-        return s
-    try:
-        r = s.encode("latin-1")
-        if len(s) < 2:
-            bc[s] = r
-        return r
-    except Exception:
-        r = s.encode("utf-8")
-        if len(s) < 2:
-            bc[s] = r
-        return r
-
-
-@overload
-def str_(b: str) -> str:
-    ...
-
-
-@overload
-def str_(b: bytes) -> str:
-    ...
-
-
-def str_(b: Union[str, bytes]) -> str:
-    if isinstance(b, bytes):
-        return b.decode("latin-1")
-    else:
-        return b
-
-
 @overload
 def ord_(b: str) -> int:
     ...
@@ -349,34 +393,6 @@ def ord_(b: Union[int, str, bytes]) -> Union[int, bytes]:
     return b
 
 
-def hexencode(b: bytes) -> bytes:
-
-    coder = getencoder("hex_codec")
-    coded = coder(b)  # type: ignore
-    return coded[0]
-
-
-def hex_str(num: int) -> str:
-    return hex(num).replace("L", "")
-
-
-WHITESPACES = (b" ", b"\n", b"\r", b"\t", b"\x00")
-
-
-def paeth_predictor(left: int, up: int, up_left: int) -> int:
-    p = left + up - up_left
-    dist_left = abs(p - left)
-    dist_up = abs(p - up)
-    dist_up_left = abs(p - up_left)
-
-    if dist_left <= dist_up and dist_left <= dist_up_left:
-        return left
-    elif dist_up <= dist_up_left:
-        return up
-    else:
-        return up_left
-
-
 def deprecate(msg: str, stacklevel: int = 3) -> None:
     warnings.warn(msg, DeprecationWarning, stacklevel=stacklevel)
 
@@ -385,36 +401,41 @@ def deprecation(msg: str) -> None:
     raise DeprecationError(msg)
 
 
-def deprecate_with_replacement(
-    old_name: str, new_name: str, removed_in: str = "3.0.0"
-) -> None:
-    """
-    Raise an exception that a feature will be removed, but has a replacement.
-    """
-    deprecate(DEPR_MSG.format(old_name, new_name, removed_in), 4)
+def deprecate_with_replacement(old_name: str, new_name: str, removed_in: str) -> None:
+    """Issue a warning that a feature will be removed, but has a replacement."""
+    deprecate(
+        f"{old_name} is deprecated and will be removed in pypdf {removed_in}. Use {new_name} instead.",
+        4,
+    )
 
 
-def deprecation_with_replacement(
-    old_name: str, new_name: str, removed_in: str = "3.0.0"
-) -> None:
-    """
-    Raise an exception that a feature was already removed, but has a replacement.
-    """
-    deprecation(DEPR_MSG_HAPPENED.format(old_name, removed_in, new_name))
+def deprecation_with_replacement(old_name: str, new_name: str, removed_in: str) -> None:
+    """Raise an exception that a feature was already removed, but has a replacement."""
+    deprecation(
+        f"{old_name} is deprecated and was removed in pypdf {removed_in}. Use {new_name} instead."
+    )
 
 
-def deprecate_no_replacement(name: str, removed_in: str = "3.0.0") -> None:
-    """
-    Raise an exception that a feature will be removed without replacement.
-    """
-    deprecate(DEPR_MSG_NO_REPLACEMENT.format(name, removed_in), 4)
+def deprecate_no_replacement(name: str, removed_in: str) -> None:
+    """Issue a warning that a feature will be removed without replacement."""
+    deprecate(f"{name} is deprecated and will be removed in pypdf {removed_in}.", 4)
 
 
-def deprecation_no_replacement(name: str, removed_in: str = "3.0.0") -> None:
+def deprecation_no_replacement(name: str, removed_in: str) -> None:
+    """Raise an exception that a feature was already removed without replacement."""
+    deprecation(f"{name} is deprecated and was removed in pypdf {removed_in}.")
+
+
+def logger_error(msg: str, src: str) -> None:
     """
-    Raise an exception that a feature was already removed without replacement.
+    Use this instead of logger.error directly.
+
+    That allows people to overwrite it more easily.
+
+    See the docs on when to use which:
+    https://pypdf.readthedocs.io/en/latest/user/suppress-warnings.html
     """
-    deprecation(DEPR_MSG_NO_REPLACEMENT_HAPPENED.format(name, removed_in))
+    logging.getLogger(src).error(msg)
 
 
 def logger_warning(msg: str, src: str) -> None:
@@ -436,32 +457,19 @@ def logger_warning(msg: str, src: str) -> None:
     logging.getLogger(src).warning(msg)
 
 
-def deprecation_bookmark(**aliases: str) -> Callable:
-    """
-    Decorator for deprecated term "bookmark"
-    To be used for methods and function arguments
-        outline_item = a bookmark
-        outline = a collection of outline items
-    """
-
-    def decoration(func: Callable):  # type: ignore
-        @functools.wraps(func)
-        def wrapper(*args, **kwargs):  # type: ignore
-            rename_kwargs(func.__name__, kwargs, aliases, fail=True)
-            return func(*args, **kwargs)
-
-        return wrapper
-
-    return decoration
-
-
-def rename_kwargs(  # type: ignore
-    func_name: str, kwargs: Dict[str, Any], aliases: Dict[str, str], fail: bool = False
-):
+def rename_kwargs(
+    func_name: str, kwargs: dict[str, Any], aliases: dict[str, str], fail: bool = False
+) -> None:
     """
     Helper function to deprecate arguments.
-    """
 
+    Args:
+        func_name: Name of the function to be deprecated
+        kwargs:
+        aliases:
+        fail:
+
+    """
     for old_term, new_term in aliases.items():
         if old_term in kwargs:
             if fail:
@@ -480,27 +488,144 @@ def rename_kwargs(  # type: ignore
                     f"{old_term} is deprecated as an argument. Use {new_term} instead"
                 ),
                 category=DeprecationWarning,
+                stacklevel=3,
             )
 
 
 def _human_readable_bytes(bytes: int) -> str:
     if bytes < 10**3:
         return f"{bytes} Byte"
-    elif bytes < 10**6:
+    if bytes < 10**6:
         return f"{bytes / 10**3:.1f} kB"
-    elif bytes < 10**9:
+    if bytes < 10**9:
         return f"{bytes / 10**6:.1f} MB"
-    else:
-        return f"{bytes / 10**9:.1f} GB"
+    return f"{bytes / 10**9:.1f} GB"
+
+
+# The following class has been copied from Django:
+# https://github.com/django/django/blob/adae619426b6f50046b3daaa744db52989c9d6db/django/utils/functional.py#L51-L65
+# It received some modifications to comply with our own coding standards.
+#
+# Original license:
+#
+# ---------------------------------------------------------------------------------
+# Copyright (c) Django Software Foundation and individual contributors.
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without modification,
+# are permitted provided that the following conditions are met:
+#
+#     1. Redistributions of source code must retain the above copyright notice,
+#        this list of conditions and the following disclaimer.
+#
+#     2. Redistributions in binary form must reproduce the above copyright
+#        notice, this list of conditions and the following disclaimer in the
+#        documentation and/or other materials provided with the distribution.
+#
+#     3. Neither the name of Django nor the names of its contributors may be used
+#        to endorse or promote products derived from this software without
+#        specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+# ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+# WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+# ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+# (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+# LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+# ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+# SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+# ---------------------------------------------------------------------------------
+class classproperty:  # noqa: N801
+    """
+    Decorator that converts a method with a single cls argument into a property
+    that can be accessed directly from the class.
+    """
+
+    def __init__(self, method=None) -> None:  # type: ignore  # noqa: ANN001
+        self.fget = method
+
+    def __get__(self, instance, cls=None) -> Any:  # type: ignore  # noqa: ANN001
+        return self.fget(cls)
+
+    def getter(self, method) -> Self:  # type: ignore  # noqa: ANN001
+        self.fget = method
+        return self
 
 
 @dataclass
 class File:
-    name: str
-    data: bytes
+    from .generic import IndirectObject  # noqa: PLC0415
+
+    name: str = ""
+    """
+    Filename as identified within the PDF file.
+    """
+    data: bytes = b""
+    """
+    Data as bytes.
+    """
+    indirect_reference: Optional[IndirectObject] = None
+    """
+    Reference to the object storing the stream.
+    """
 
     def __str__(self) -> str:
-        return f"File(name={self.name}, data: {_human_readable_bytes(len(self.data))})"
+        return f"{self.__class__.__name__}(name={self.name}, data: {_human_readable_bytes(len(self.data))})"
 
     def __repr__(self) -> str:
-        return f"File(name={self.name}, data: {_human_readable_bytes(len(self.data))}, hash: {hash(self.data)})"
+        return self.__str__()[:-1] + f", hash: {hash(self.data)})"
+
+
+@functools.total_ordering
+class Version:
+    COMPONENT_PATTERN = re.compile(r"^(\d+)(.*)$")
+
+    def __init__(self, version_str: str) -> None:
+        self.version_str = version_str
+        self.components = self._parse_version(version_str)
+
+    def _parse_version(self, version_str: str) -> list[tuple[int, str]]:
+        components = version_str.split(".")
+        parsed_components = []
+        for component in components:
+            match = Version.COMPONENT_PATTERN.match(component)
+            if not match:
+                parsed_components.append((0, component))
+                continue
+            integer_prefix = match.group(1)
+            suffix = match.group(2)
+            if integer_prefix is None:
+                integer_prefix = 0
+            parsed_components.append((int(integer_prefix), suffix))
+        return parsed_components
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, Version):
+            return False
+        return self.components == other.components
+
+    def __hash__(self) -> int:
+        # Convert to tuple as lists cannot be hashed.
+        return hash((self.__class__, tuple(self.components)))
+
+    def __lt__(self, other: Any) -> bool:
+        if not isinstance(other, Version):
+            raise ValueError(f"Version cannot be compared against {type(other)}")
+
+        for self_component, other_component in zip(self.components, other.components):
+            self_value, self_suffix = self_component
+            other_value, other_suffix = other_component
+
+            if self_value < other_value:
+                return True
+            if self_value > other_value:
+                return False
+
+            if self_suffix < other_suffix:
+                return True
+            if self_suffix > other_suffix:
+                return False
+
+        return len(self.components) < len(other.components)

@@ -27,79 +27,72 @@
 # ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 
-import codecs
-import collections
 import decimal
-import logging
-import random
+import enum
+import hashlib
 import re
 import struct
-import time
+import sys
 import uuid
-import warnings
-from hashlib import md5
+from collections.abc import Iterable, Mapping
 from io import BytesIO, FileIO, IOBase
+from itertools import compress
 from pathlib import Path
+from re import Pattern
 from types import TracebackType
 from typing import (
     IO,
     Any,
     Callable,
-    Deque,
-    Dict,
-    Iterable,
-    List,
     Optional,
-    Pattern,
-    Tuple,
-    Type,
     Union,
     cast,
 )
 
-from ._encryption import Encryption
-from ._page import PageObject, _VirtualList
+if sys.version_info >= (3, 11):
+    from typing import Self
+else:
+    from typing_extensions import Self
+
+from ._doc_common import DocumentInformation, PdfDocCommon
+from ._encryption import EncryptAlgorithm, Encryption
+from ._page import PageObject, Transformation
 from ._page_labels import nums_clear_range, nums_insert, nums_next
 from ._reader import PdfReader
-from ._security import _alg33, _alg34, _alg35
 from ._utils import (
     StrByteType,
     StreamType,
     _get_max_pdf_version_header,
-    b_,
-    deprecate_with_replacement,
-    deprecation_bookmark,
-    deprecation_with_replacement,
+    deprecation_no_replacement,
     logger_warning,
 )
-from .constants import AnnotationDictionaryAttributes
+from .constants import AnnotationDictionaryAttributes as AA
 from .constants import CatalogAttributes as CA
-from .constants import CatalogDictionary
-from .constants import Core as CO
-from .constants import EncryptionDictAttributes as ED
 from .constants import (
-    FieldDictionaryAttributes,
-    FieldFlag,
-    FileSpecificationDictionaryEntries,
+    CatalogDictionary,
     GoToActionArguments,
+    ImageType,
     InteractiveFormDictEntries,
+    OutlineFontFlag,
+    PageLabelStyle,
+    PagesAttributes,
+    TypFitArguments,
+    UserAccessPermissions,
 )
+from .constants import Core as CO
+from .constants import FieldDictionaryAttributes as FA
 from .constants import PageAttributes as PG
-from .constants import PageLabelStyle
-from .constants import PagesAttributes as PA
-from .constants import StreamAttributes as SA
 from .constants import TrailerKeys as TK
-from .constants import TypFitArguments, UserAccessPermissions
+from .errors import PdfReadError, PyPdfError
 from .generic import (
     PAGE_FIT,
-    AnnotationBuilder,
     ArrayObject,
     BooleanObject,
     ByteStringObject,
     ContentStream,
-    DecodedStreamObject,
     Destination,
     DictionaryObject,
+    EmbeddedFile,
     Fit,
     FloatObject,
     IndirectObject,
@@ -108,204 +101,489 @@ from .generic import (
     NumberObject,
     PdfObject,
     RectangleObject,
+    ReferenceLink,
     StreamObject,
     TextStringObject,
     TreeObject,
+    ViewerPreferences,
     create_string_object,
+    extract_links,
     hex_to_rgb,
+    is_null_or_none,
 )
+from .generic._appearance_stream import TextStreamAppearance
 from .pagerange import PageRange, PageRangeSpec
 from .types import (
+    AnnotationSubtype,
     BorderArrayType,
-    FitType,
     LayoutType,
     OutlineItemType,
     OutlineType,
     PagemodeType,
-    ZoomArgType,
 )
+from .xmp import XmpInformation
 
-logger = logging.getLogger(__name__)
-
-
-OPTIONAL_READ_WRITE_FIELD = FieldFlag(0)
-ALL_DOCUMENT_PERMISSIONS = UserAccessPermissions((2**31 - 1) - 3)
+ALL_DOCUMENT_PERMISSIONS = UserAccessPermissions.all()
 
 
-class PdfWriter:
+class ObjectDeletionFlag(enum.IntFlag):
+    NONE = 0
+    TEXT = enum.auto()
+    LINKS = enum.auto()
+    ATTACHMENTS = enum.auto()
+    OBJECTS_3D = enum.auto()
+    ALL_ANNOTATIONS = enum.auto()
+    XOBJECT_IMAGES = enum.auto()
+    INLINE_IMAGES = enum.auto()
+    DRAWING_IMAGES = enum.auto()
+    IMAGES = XOBJECT_IMAGES | INLINE_IMAGES | DRAWING_IMAGES
+
+
+def _rolling_checksum(stream: BytesIO, blocksize: int = 65536) -> str:
+    hash = hashlib.md5(usedforsecurity=False)
+    for block in iter(lambda: stream.read(blocksize), b""):
+        hash.update(block)
+    return hash.hexdigest()
+
+
+class PdfWriter(PdfDocCommon):
     """
-    Write a PDF file out, given pages produced by another class.
+    Write a PDF file out, given pages produced by another class or through
+    cloning a PDF file during initialization.
 
     Typically data is added from a :class:`PdfReader<pypdf.PdfReader>`.
+
+    Args:
+        clone_from: identical to fileobj (for compatibility)
+
+        incremental: If true, loads the document and set the PdfWriter in incremental mode.
+
+            When writing incrementally, the original document is written first and new/modified
+            content is appended. To be used for signed document/forms to keep signature valid.
+
+        full: If true, loads all the objects (always full if incremental = True).
+            This parameter may allow loading large PDFs.
+
+        strict: If true, pypdf will raise an exception if a PDF does not follow the specification.
+            If false, pypdf will try to be forgiving and do something reasonable, but it will log
+            a warning message. It is a best-effort approach.
+
     """
 
-    def __init__(self, fileobj: StrByteType = "") -> None:
-        self._header = b"%PDF-1.3"
-        self._objects: List[PdfObject] = []  # array of indirect objects
-        self._idnum_hash: Dict[bytes, IndirectObject] = {}
-        self._id_translated: Dict[int, Dict[int, int]] = {}
+    def __init__(
+        self,
+        fileobj: Union[None, PdfReader, StrByteType, Path] = "",
+        clone_from: Union[None, PdfReader, StrByteType, Path] = None,
+        incremental: bool = False,
+        full: bool = False,
+        strict: bool = False,
+    ) -> None:
+        self.strict = strict
+        """
+        If true, pypdf will raise an exception if a PDF does not follow the specification.
+        If false, pypdf will try to be forgiving and do something reasonable, but it will log
+        a warning message. It is a best-effort approach.
+        """
 
-        # The root of our page tree node.
-        pages = DictionaryObject()
-        pages.update(
-            {
-                NameObject(PA.TYPE): NameObject("/Pages"),
-                NameObject(PA.COUNT): NumberObject(0),
-                NameObject(PA.KIDS): ArrayObject(),
-            }
-        )
-        self._pages = self._add_object(pages)
+        self.incremental = incremental or full
+        """
+        Returns if the PdfWriter object has been started in incremental mode.
+        """
 
-        # info object
-        info = DictionaryObject()
-        info.update(
-            {
-                NameObject("/Producer"): create_string_object(
-                    codecs.BOM_UTF16_BE + "pypdf".encode("utf-16be")
+        self._objects: list[Optional[PdfObject]] = []
+        """
+        The indirect objects in the PDF.
+        For the incremental case, it will be filled with None
+        in clone_reader_document_root.
+        """
+
+        self._original_hash: list[int] = []
+        """
+        List of hashes after import; used to identify changes.
+        """
+
+        self._idnum_hash: dict[bytes, tuple[IndirectObject, list[IndirectObject]]] = {}
+        """
+        Maps hash values of indirect objects to the list of IndirectObjects.
+        This is used for compression.
+        """
+
+        self._id_translated: dict[int, dict[int, int]] = {}
+        """List of already translated IDs.
+           dict[id(pdf)][(idnum, generation)]
+        """
+
+        self._info_obj: Optional[PdfObject]
+        """The PDF files's document information dictionary,
+        defined by Info in the PDF file's trailer dictionary."""
+
+        self._ID: Union[ArrayObject, None] = None
+        """The PDF file identifier,
+        defined by the ID in the PDF file's trailer dictionary."""
+
+        self._unresolved_links: list[tuple[ReferenceLink, ReferenceLink]] = []
+        "Tracks links in pages added to the writer for resolving later."
+        self._merged_in_pages: dict[Optional[IndirectObject], Optional[IndirectObject]] = {}
+        "Tracks pages added to the writer and what page they turned into."
+
+        if self.incremental:
+            if isinstance(fileobj, (str, Path)):
+                with open(fileobj, "rb") as f:
+                    fileobj = BytesIO(f.read(-1))
+            if isinstance(fileobj, BytesIO):
+                fileobj = PdfReader(fileobj)
+            if not isinstance(fileobj, PdfReader):
+                raise PyPdfError("Invalid type for incremental mode")
+            self._reader = fileobj  # prev content is in _reader.stream
+            self._header = fileobj.pdf_header.encode()
+            self._readonly = True  # TODO: to be analysed
+        else:
+            self._header = b"%PDF-1.3"
+            self._info_obj = self._add_object(
+                DictionaryObject(
+                    {NameObject("/Producer"): create_string_object("pypdf")}
                 )
-            }
-        )
-        self._info = self._add_object(info)
+            )
 
-        # root object
-        self._root_object = DictionaryObject()
-        self._root_object.update(
+        def _get_clone_from(
+            fileobj: Union[None, PdfReader, str, Path, IO[Any], BytesIO],
+            clone_from: Union[None, PdfReader, str, Path, IO[Any], BytesIO],
+        ) -> Union[None, PdfReader, str, Path, IO[Any], BytesIO]:
+            if isinstance(fileobj, (str, Path, IO, BytesIO)) and (
+                fileobj == "" or clone_from is not None
+            ):
+                return clone_from
+            cloning = True
+            if isinstance(fileobj, (str, Path)) and (
+                not Path(str(fileobj)).exists()
+                or Path(str(fileobj)).stat().st_size == 0
+            ):
+                cloning = False
+            if isinstance(fileobj, (IOBase, BytesIO)):
+                t = fileobj.tell()
+                if fileobj.seek(0, 2) == 0:
+                    cloning = False
+                fileobj.seek(t, 0)
+            if cloning:
+                clone_from = fileobj
+            return clone_from
+
+        clone_from = _get_clone_from(fileobj, clone_from)
+        # To prevent overwriting
+        self.temp_fileobj = fileobj
+        self.fileobj = ""
+        self._with_as_usage = False
+        self._cloned = False
+        # The root of our page tree node
+        pages = DictionaryObject(
             {
-                NameObject(PA.TYPE): NameObject(CO.CATALOG),
-                NameObject(CO.PAGES): self._pages,
+                NameObject(PagesAttributes.TYPE): NameObject("/Pages"),
+                NameObject(PagesAttributes.COUNT): NumberObject(0),
+                NameObject(PagesAttributes.KIDS): ArrayObject(),
             }
         )
-        self._root = self._add_object(self._root_object)
-        self.fileobj = fileobj
-        self.with_as_usage = False
+        self.flattened_pages = []
+        self._encryption: Optional[Encryption] = None
+        self._encrypt_entry: Optional[DictionaryObject] = None
 
-    def __enter__(self) -> "PdfWriter":
-        """Store that writer is initialized by 'with'."""
-        self.with_as_usage = True
+        if clone_from is not None:
+            if not isinstance(clone_from, PdfReader):
+                clone_from = PdfReader(clone_from)
+            self.clone_document_from_reader(clone_from)
+            self._cloned = True
+        else:
+            self._pages = self._add_object(pages)
+            self._root_object = DictionaryObject(
+                {
+                    NameObject(PagesAttributes.TYPE): NameObject(CO.CATALOG),
+                    NameObject(CO.PAGES): self._pages,
+                }
+            )
+            self._add_object(self._root_object)
+        if full and not incremental:
+            self.incremental = False
+        if isinstance(self._ID, list):
+            if isinstance(self._ID[0], TextStringObject):
+                self._ID[0] = ByteStringObject(self._ID[0].get_original_bytes())
+            if isinstance(self._ID[1], TextStringObject):
+                self._ID[1] = ByteStringObject(self._ID[1].get_original_bytes())
+
+    # for commonality
+    @property
+    def is_encrypted(self) -> bool:
+        """
+        Read-only boolean property showing whether this PDF file is encrypted.
+
+        Note that this property, if true, will remain true even after the
+        :meth:`decrypt()<pypdf.PdfReader.decrypt>` method is called.
+        """
+        return False
+
+    @property
+    def root_object(self) -> DictionaryObject:
+        """
+        Provide direct access to PDF Structure.
+
+        Note:
+            Recommended only for read access.
+
+        """
+        return self._root_object
+
+    @property
+    def _info(self) -> Optional[DictionaryObject]:
+        """
+        Provide access to "/Info". Standardized with PdfReader.
+
+        Returns:
+            /Info Dictionary; None if the entry does not exist
+
+        """
+        return (
+            None
+            if self._info_obj is None
+            else cast(DictionaryObject, self._info_obj.get_object())
+        )
+
+    @_info.setter
+    def _info(self, value: Optional[Union[IndirectObject, DictionaryObject]]) -> None:
+        if value is None:
+            try:
+                self._objects[self._info_obj.indirect_reference.idnum - 1] = None  # type: ignore
+            except (KeyError, AttributeError):
+                pass
+            self._info_obj = None
+        else:
+            if self._info_obj is None:
+                self._info_obj = self._add_object(DictionaryObject())
+            obj = cast(DictionaryObject, self._info_obj.get_object())
+            obj.clear()
+            obj.update(cast(DictionaryObject, value.get_object()))
+
+    @property
+    def xmp_metadata(self) -> Optional[XmpInformation]:
+        """XMP (Extensible Metadata Platform) data."""
+        return cast(XmpInformation, self.root_object.xmp_metadata)
+
+    @xmp_metadata.setter
+    def xmp_metadata(self, value: Union[XmpInformation, bytes, None]) -> None:
+        """XMP (Extensible Metadata Platform) data."""
+        if value is None:
+            if "/Metadata" in self.root_object:
+                del self.root_object["/Metadata"]
+            return
+
+        metadata = self.root_object.get("/Metadata", None)
+        if not isinstance(metadata, IndirectObject):
+            if metadata is not None:
+                del self.root_object["/Metadata"]
+            metadata_stream = StreamObject()
+            stream_reference = self._add_object(metadata_stream)
+            self.root_object[NameObject("/Metadata")] = stream_reference
+        else:
+            metadata_stream = cast(StreamObject, metadata.get_object())
+
+        if isinstance(value, XmpInformation):
+            bytes_data = value.stream.get_data()
+        else:
+            bytes_data = value
+        metadata_stream.set_data(bytes_data)
+
+    @property
+    def with_as_usage(self) -> bool:
+        deprecation_no_replacement("with_as_usage", "5.0")
+        return self._with_as_usage
+
+    @with_as_usage.setter
+    def with_as_usage(self, value: bool) -> None:
+        deprecation_no_replacement("with_as_usage", "5.0")
+        self._with_as_usage = value
+
+    def __enter__(self) -> Self:
+        """Store how writer is initialized by 'with'."""
+        c: bool = self._cloned
+        t = self.temp_fileobj
+        self.__init__()  # type: ignore
+        self._cloned = c
+        self._with_as_usage = True
+        self.fileobj = t  # type: ignore
         return self
 
     def __exit__(
         self,
-        exc_type: Optional[Type[BaseException]],
+        exc_type: Optional[type[BaseException]],
         exc: Optional[BaseException],
         traceback: Optional[TracebackType],
     ) -> None:
         """Write data to the fileobj."""
-        if self.fileobj:
+        if self.fileobj and not self._cloned:
             self.write(self.fileobj)
 
     @property
-    def pdf_header(self) -> bytes:
+    def pdf_header(self) -> str:
         """
-        Header of the PDF document that is written.
+        Read/Write property of the PDF header that is written.
 
-        This should be something like ``b'%PDF-1.5'``. It is recommended to set
+        This should be something like ``'%PDF-1.5'``. It is recommended to set
         the lowest version that supports all features which are used within the
         PDF file.
+
+        Note: `pdf_header` returns a string but accepts bytes or str for writing
         """
-        return self._header
+        return self._header.decode()
 
     @pdf_header.setter
-    def pdf_header(self, new_header: bytes) -> None:
+    def pdf_header(self, new_header: Union[str, bytes]) -> None:
+        if isinstance(new_header, str):
+            new_header = new_header.encode()
         self._header = new_header
 
     def _add_object(self, obj: PdfObject) -> IndirectObject:
-        if hasattr(obj, "indirect_reference") and obj.indirect_reference.pdf == self:  # type: ignore
+        if (
+            getattr(obj, "indirect_reference", None) is not None
+            and obj.indirect_reference.pdf == self  # type: ignore
+        ):
             return obj.indirect_reference  # type: ignore
+        # check for /Contents in Pages (/Contents in annotations are strings)
+        if isinstance(obj, DictionaryObject) and isinstance(
+            obj.get(PG.CONTENTS, None), (ArrayObject, DictionaryObject)
+        ):
+            obj[NameObject(PG.CONTENTS)] = self._add_object(obj[PG.CONTENTS])
         self._objects.append(obj)
         obj.indirect_reference = IndirectObject(len(self._objects), 0, self)
         return obj.indirect_reference
 
     def get_object(
         self,
-        indirect_reference: Union[None, int, IndirectObject] = None,
-        ido: Optional[IndirectObject] = None,
+        indirect_reference: Union[int, IndirectObject],
     ) -> PdfObject:
-        if ido is not None:  # deprecated
-            if indirect_reference is not None:
-                raise ValueError(
-                    "Please only set 'indirect_reference'. The 'ido' argument "
-                    "is deprecated."
-                )
-            else:
-                indirect_reference = ido
-                warnings.warn(
-                    "The parameter 'ido' is depreciated and will be removed in "
-                    "pypdf 4.0.0.",
-                    DeprecationWarning,
-                )
-        assert (
-            indirect_reference is not None
-        )  # the None value is only there to keep the deprecated name
         if isinstance(indirect_reference, int):
-            return self._objects[indirect_reference - 1]
-        if indirect_reference.pdf != self:
-            raise ValueError("pdf must be self")
-        return self._objects[indirect_reference.idnum - 1]  # type: ignore
+            obj = self._objects[indirect_reference - 1]
+        elif indirect_reference.pdf != self:
+            raise ValueError("PDF must be self")
+        else:
+            obj = self._objects[indirect_reference.idnum - 1]
+        assert obj is not None, "mypy"
+        return obj
 
-    def getObject(self, ido: Union[int, IndirectObject]) -> PdfObject:  # deprecated
-        """
-        .. deprecated:: 1.28.0
+    def _replace_object(
+        self,
+        indirect_reference: Union[int, IndirectObject],
+        obj: PdfObject,
+    ) -> PdfObject:
+        if isinstance(indirect_reference, IndirectObject):
+            if indirect_reference.pdf != self:
+                raise ValueError("PDF must be self")
+            indirect_reference = indirect_reference.idnum
+        gen = self._objects[indirect_reference - 1].indirect_reference.generation  # type: ignore
+        if (
+            getattr(obj, "indirect_reference", None) is not None
+            and obj.indirect_reference.pdf != self  # type: ignore
+        ):
+            obj = obj.clone(self)
+        self._objects[indirect_reference - 1] = obj
+        obj.indirect_reference = IndirectObject(indirect_reference, gen, self)
 
-            Use :meth:`get_object` instead.
-        """
-        deprecation_with_replacement("getObject", "get_object", "3.0.0")
-        return self.get_object(ido)
+        assert isinstance(obj, PdfObject), "mypy"
+        return obj
 
     def _add_page(
         self,
         page: PageObject,
-        action: Callable[[Any, IndirectObject], None],
+        index: int,
         excluded_keys: Iterable[str] = (),
     ) -> PageObject:
-        assert cast(str, page[PA.TYPE]) == CO.PAGE
+        if not isinstance(page, PageObject) or page.get(PagesAttributes.TYPE, None) != CO.PAGE:
+            raise ValueError("Invalid page object")
+        assert self.flattened_pages is not None, "for mypy"
         page_org = page
         excluded_keys = list(excluded_keys)
-        excluded_keys += [PA.PARENT, "/StructParents"]
-        # acrobat does not accept to have two indirect ref pointing on the same
-        # page; therefore in order to add easily multiple copies of the same "
-        # page, we need to create a new dictionary for the page, however the "
-        # objects below (including content) is not duplicated
+        excluded_keys += [PagesAttributes.PARENT, "/StructParents"]
+        # Acrobat does not accept two indirect references pointing on the same
+        # page; therefore in order to add multiple copies of the same
+        # page, we need to create a new dictionary for the page, however the
+        # objects below (including content) are not duplicated:
         try:  # delete an already existing page
             del self._id_translated[id(page_org.indirect_reference.pdf)][  # type: ignore
                 page_org.indirect_reference.idnum  # type: ignore
             ]
         except Exception:
             pass
-        page = cast("PageObject", page_org.clone(self, False, excluded_keys))
-        # page_ind = self._add_object(page)
+
+        page = cast(
+            "PageObject", page_org.clone(self, False, excluded_keys).get_object()
+        )
         if page_org.pdf is not None:
             other = page_org.pdf.pdf_header
-            if isinstance(other, str):
-                other = other.encode()  # type: ignore
-            self.pdf_header = _get_max_pdf_version_header(self.pdf_header, other)  # type: ignore
-        page[NameObject(PA.PARENT)] = self._pages
-        pages = cast(DictionaryObject, self.get_object(self._pages))
-        assert page.indirect_reference is not None
-        action(pages[PA.KIDS], page.indirect_reference)
-        page_count = cast(int, pages[PA.COUNT])
-        pages[NameObject(PA.COUNT)] = NumberObject(page_count + 1)
+            self.pdf_header = _get_max_pdf_version_header(self.pdf_header, other)
+
+        node, idx = self._get_page_in_node(index)
+        page[NameObject(PagesAttributes.PARENT)] = node.indirect_reference
+
+        if idx >= 0:
+            cast(ArrayObject, node[PagesAttributes.KIDS]).insert(idx, page.indirect_reference)
+            self.flattened_pages.insert(index, page)
+        else:
+            cast(ArrayObject, node[PagesAttributes.KIDS]).append(page.indirect_reference)
+            self.flattened_pages.append(page)
+        recurse = 0
+        while not is_null_or_none(node):
+            node = cast(DictionaryObject, node.get_object())
+            node[NameObject(PagesAttributes.COUNT)] = NumberObject(cast(int, node[PagesAttributes.COUNT]) + 1)
+            node = node.get(PagesAttributes.PARENT, None)  # type: ignore[assignment]  # TODO: Fix.
+            recurse += 1
+            if recurse > 1000:
+                raise PyPdfError("Too many recursive calls!")
+
+        if page_org.pdf is not None:
+            # the page may contain links to other pages, and those other
+            # pages may or may not already be added.  we store the
+            # information we need, so that we can resolve the references
+            # later.
+            self._unresolved_links.extend(extract_links(page, page_org))
+            self._merged_in_pages[page_org.indirect_reference] = page.indirect_reference
+
         return page
 
-    def set_need_appearances_writer(self) -> None:
-        # See 12.7.2 and 7.7.2 for more information:
-        # http://www.adobe.com/content/dam/acom/en/devnet/acrobat/pdfs/PDF32000_2008.pdf
+    def set_need_appearances_writer(self, state: bool = True) -> None:
+        """
+        Sets the "NeedAppearances" flag in the PDF writer.
+
+        The "NeedAppearances" flag indicates whether the appearance dictionary
+        for form fields should be automatically generated by the PDF viewer or
+        if the embedded appearance should be used.
+
+        Args:
+            state: The actual value of the NeedAppearances flag.
+
+        Returns:
+            None
+
+        """
+        # See §12.7.2 and §7.7.2 for more information:
+        # https://opensource.adobe.com/dc-acrobat-sdk-docs/pdfstandards/PDF32000_2008.pdf
         try:
-            catalog = self._root_object
             # get the AcroForm tree
-            if CatalogDictionary.ACRO_FORM not in catalog:
-                self._root_object.update(
-                    {
-                        NameObject(CatalogDictionary.ACRO_FORM): IndirectObject(
-                            len(self._objects), 0, self
-                        )
-                    }
-                )
+            if CatalogDictionary.ACRO_FORM not in self._root_object:
+                self._root_object[
+                    NameObject(CatalogDictionary.ACRO_FORM)
+                ] = self._add_object(DictionaryObject())
 
             need_appearances = NameObject(InteractiveFormDictEntries.NeedAppearances)
-            self._root_object[CatalogDictionary.ACRO_FORM][need_appearances] = BooleanObject(True)  # type: ignore
-        except Exception as exc:
-            logger.error("set_need_appearances_writer() catch : ", repr(exc))
+            cast(DictionaryObject, self._root_object[CatalogDictionary.ACRO_FORM])[
+                need_appearances
+            ] = BooleanObject(state)
+        except Exception as exc:  # pragma: no cover
+            logger_warning(
+                f"set_need_appearances_writer({state}) catch : {exc}", __name__
+            )
+
+    def create_viewer_preferences(self) -> ViewerPreferences:
+        o = ViewerPreferences()
+        self._root_object[
+            NameObject(CatalogDictionary.VIEWER_PREFERENCES)
+        ] = self._add_object(o)
+        return o
 
     def add_page(
         self,
@@ -314,33 +592,23 @@ class PdfWriter:
     ) -> PageObject:
         """
         Add a page to this PDF file.
-        Recommended for advanced usage including the adequate excluded_keys
+
+        Recommended for advanced usage including the adequate excluded_keys.
 
         The page is usually acquired from a :class:`PdfReader<pypdf.PdfReader>`
         instance.
 
         Args:
-          page: The page to add to the document. Should be
-            an instance of :class:`PageObject<pypdf._page.PageObject>`
-          excluded_keys:
+            page: The page to add to the document. Should be
+                an instance of :class:`PageObject<pypdf._page.PageObject>`
+            excluded_keys:
 
         Returns:
-          The added PageObject.
-        """
-        return self._add_page(page, list.append, excluded_keys)
+            The added PageObject.
 
-    def addPage(
-        self,
-        page: PageObject,
-        excluded_keys: Iterable[str] = (),
-    ) -> PageObject:  # deprecated
         """
-        .. deprecated:: 1.28.0
-
-            Use :meth:`add_page` instead.
-        """
-        deprecation_with_replacement("addPage", "add_page", "3.0.0")
-        return self.add_page(page, excluded_keys)
+        assert self.flattened_pages is not None, "mypy"
+        return self._add_page(page, len(self.flattened_pages), excluded_keys)
 
     def insert_page(
         self,
@@ -353,142 +621,99 @@ class PdfWriter:
         :class:`PdfReader<pypdf.PdfReader>` instance.
 
         Args:
-          page: The page to add to the document.
-          index: Position at which the page will be inserted.
-          excluded_keys:
+            page: The page to add to the document.
+            index: Position at which the page will be inserted.
+            excluded_keys:
 
         Returns:
-          The added PageObject.
-        """
-        return self._add_page(page, lambda kids, p: kids.insert(index, p))
+            The added PageObject.
 
-    def insertPage(
-        self,
-        page: PageObject,
-        index: int = 0,
-        excluded_keys: Iterable[str] = (),
-    ) -> PageObject:  # deprecated
         """
-        .. deprecated:: 1.28.0
+        assert self.flattened_pages is not None, "mypy"
+        if index < 0:
+            index += len(self.flattened_pages)
+        if index < 0:
+            raise ValueError("Invalid index value")
+        if index >= len(self.flattened_pages):
+            return self.add_page(page, excluded_keys)
+        return self._add_page(page, index, excluded_keys)
 
-            Use :meth:`insert_page` instead.
+    def _get_page_number_by_indirect(
+        self, indirect_reference: Union[None, int, NullObject, IndirectObject]
+    ) -> Optional[int]:
         """
-        deprecation_with_replacement("insertPage", "insert_page", "3.0.0")
-        return self.insert_page(page, index, excluded_keys)
-
-    def get_page(
-        self, page_number: Optional[int] = None, pageNumber: Optional[int] = None
-    ) -> PageObject:
-        """
-        Retrieve a page by number from this PDF file.
+        Generate _page_id2num.
 
         Args:
-          page_number: The page number to retrieve
-            (pages begin at zero)
+            indirect_reference:
 
         Returns:
-          The page at the index given by *page_number*
+            The page number or None
+
         """
-        if pageNumber is not None:  # deprecated
-            if page_number is not None:
-                raise ValueError("Please only use the page_number parameter")
-            deprecate_with_replacement(
-                "get_page(pageNumber)", "get_page(page_number)", "4.0.0"
-            )
-            page_number = pageNumber
-        if page_number is None and pageNumber is None:  # deprecated
-            raise ValueError("Please specify the page_number")
-        pages = cast(Dict[str, Any], self.get_object(self._pages))
-        # TODO: crude hack
-        return cast(PageObject, pages[PA.KIDS][page_number].get_object())
-
-    def getPage(self, pageNumber: int) -> PageObject:  # deprecated
-        """
-        .. deprecated:: 1.28.0
-
-            Use :code:`writer.pages[page_number]` instead.
-        """
-        deprecation_with_replacement("getPage", "writer.pages[page_number]", "3.0.0")
-        return self.get_page(pageNumber)
-
-    def _get_num_pages(self) -> int:
-        pages = cast(Dict[str, Any], self.get_object(self._pages))
-        return int(pages[NameObject("/Count")])
-
-    def getNumPages(self) -> int:  # deprecated
-        """
-        .. deprecated:: 1.28.0
-
-            Use :code:`len(writer.pages)` instead.
-        """
-        deprecation_with_replacement("getNumPages", "len(writer.pages)", "3.0.0")
-        return self._get_num_pages()
-
-    @property
-    def pages(self) -> List[PageObject]:
-        """Property that emulates a list of :class:`PageObject<pypdf._page.PageObject>`."""
-        return _VirtualList(self._get_num_pages, self.get_page)  # type: ignore
+        # To provide same function as in PdfReader
+        if is_null_or_none(indirect_reference):
+            return None
+        assert indirect_reference is not None, "mypy"
+        if isinstance(indirect_reference, int):
+            indirect_reference = IndirectObject(indirect_reference, 0, self)
+        obj = indirect_reference.get_object()
+        if isinstance(obj, PageObject):
+            return obj.page_number
+        return None
 
     def add_blank_page(
         self, width: Optional[float] = None, height: Optional[float] = None
     ) -> PageObject:
         """
-        Append a blank page to this PDF file and returns it. If no page size
-        is specified, use the size of the last page.
+        Append a blank page to this PDF file and return it.
+
+        If no page size is specified, use the size of the last page.
 
         Args:
-          width: The width of the new page expressed in default user
-            space units.
-          height: The height of the new page expressed in default
-            user space units.
+            width: The width of the new page expressed in default user
+                space units.
+            height: The height of the new page expressed in default
+                user space units.
 
         Returns:
-          The newly appended page
+            The newly appended page.
 
         Raises:
-          PageSizeNotDefinedError: if width and height are not defined
-            and previous page does not exist.
+            PageSizeNotDefinedError: if width and height are not defined
+                and previous page does not exist.
+
         """
         page = PageObject.create_blank_page(self, width, height)
-        self.add_page(page)
-        return page
-
-    def addBlankPage(
-        self, width: Optional[float] = None, height: Optional[float] = None
-    ) -> PageObject:  # deprecated
-        """
-        .. deprecated:: 1.28.0
-
-            Use :meth:`add_blank_page` instead.
-        """
-        deprecation_with_replacement("addBlankPage", "add_blank_page", "3.0.0")
-        return self.add_blank_page(width, height)
+        return self.add_page(page)
 
     def insert_blank_page(
         self,
-        width: Optional[decimal.Decimal] = None,
-        height: Optional[decimal.Decimal] = None,
+        width: Optional[Union[float, decimal.Decimal]] = None,
+        height: Optional[Union[float, decimal.Decimal]] = None,
         index: int = 0,
     ) -> PageObject:
         """
-        Insert a blank page to this PDF file and returns it. If no page size
-        is specified, use the size of the last page.
+        Insert a blank page to this PDF file and return it.
+
+        If no page size is specified for a dimension, use the size of the last page.
 
         Args:
-          width: The width of the new page expressed in default user
-            space units.
-          height: The height of the new page expressed in default
-            user space units.
-          index: Position to add the page.
+            width: The width of the new page expressed in default user
+                space units.
+            height: The height of the new page expressed in default
+                user space units.
+            index: Position to add the page.
 
         Returns:
-          The newly appended page
+            The newly inserted page.
 
         Raises:
-          PageSizeNotDefinedError: if width and height are not defined
-            and previous page does not exist.
+            PageSizeNotDefinedError: if width and height are not defined
+                and previous page does not exist.
+
         """
-        if width is None or height is None and (self._get_num_pages() - 1) >= index:
+        if width is None or (height is None and index < self.get_num_pages()):
             oldpage = self.pages[index]
             width = oldpage.mediabox.width
             height = oldpage.mediabox.height
@@ -496,44 +721,11 @@ class PdfWriter:
         self.insert_page(page, index)
         return page
 
-    def insertBlankPage(
-        self,
-        width: Optional[decimal.Decimal] = None,
-        height: Optional[decimal.Decimal] = None,
-        index: int = 0,
-    ) -> PageObject:  # deprecated
-        """
-        .. deprecated:: 1.28.0
-
-            Use :meth:`insertBlankPage` instead.
-        """
-        deprecation_with_replacement("insertBlankPage", "insert_blank_page", "3.0.0")
-        return self.insert_blank_page(width, height, index)
-
     @property
     def open_destination(
         self,
     ) -> Union[None, Destination, TextStringObject, ByteStringObject]:
-        """
-        Property to access the opening destination (``/OpenAction`` entry in the
-        PDF catalog).
-        it returns `None` if the entry does not exist is not set.
-        """
-        if "/OpenAction" not in self._root_object:
-            return None
-        oa = self._root_object["/OpenAction"]
-        if isinstance(oa, (str, bytes)):
-            return create_string_object(str(oa))
-        elif isinstance(oa, ArrayObject):
-            try:
-                page, typ = oa[0:2]  # type: ignore
-                array = oa[2:]
-                fit = Fit(typ, tuple(array))
-                return Destination("OpenAction", page, fit)
-            except Exception as exc:
-                raise Exception(f"Invalid Destination {oa}: {exc}")
-        else:
-            return None
+        return super().open_destination
 
     @open_destination.setter
     def open_destination(self, dest: Union[None, str, Destination, PageObject]) -> None:
@@ -557,15 +749,20 @@ class PdfWriter:
 
     def add_js(self, javascript: str) -> None:
         """
-        Add Javascript which will launch upon opening this PDF.
+        Add JavaScript which will launch upon opening this PDF.
 
         Args:
-          javascript: Your Javascript.
+            javascript: Your JavaScript.
 
-        >>> output.add_js("this.print({bUI:true,bSilent:false,bShrinkToFit:true});")
-        # Example: This will launch the print window when the PDF is opened.
+        Example:
+            This will launch the print window when the PDF is opened.
+
+            >>> from pypdf import PdfWriter
+            >>> output = PdfWriter()
+            >>> output.add_js("this.print({bUI:true,bSilent:false,bShrinkToFit:true});")
+
         """
-        # Names / JavaScript prefered to be able to add multiple scripts
+        # Names / JavaScript preferred to be able to add multiple scripts
         if "/Names" not in self._root_object:
             self._root_object[NameObject(CA.NAMES)] = DictionaryObject()
         names = cast(DictionaryObject, self._root_object[CA.NAMES])
@@ -573,125 +770,39 @@ class PdfWriter:
             names[NameObject("/JavaScript")] = DictionaryObject(
                 {NameObject("/Names"): ArrayObject()}
             )
-            # cast(DictionaryObject, names[NameObject("/JavaScript")])[NameObject("/Names")] = ArrayObject()
         js_list = cast(
             ArrayObject, cast(DictionaryObject, names["/JavaScript"])["/Names"]
         )
+        # We need a name for parameterized JavaScript in the PDF file,
+        # but it can be anything.
+        js_list.append(create_string_object(str(uuid.uuid4())))
 
-        js = DictionaryObject()
-        js.update(
+        js = DictionaryObject(
             {
-                NameObject(PA.TYPE): NameObject("/Action"),
+                NameObject(PagesAttributes.TYPE): NameObject("/Action"),
                 NameObject("/S"): NameObject("/JavaScript"),
                 NameObject("/JS"): TextStringObject(f"{javascript}"),
             }
         )
-        # We need a name for parameterized javascript in the pdf file,
-        # but it can be anything.
-        js_list.append(create_string_object(str(uuid.uuid4())))
         js_list.append(self._add_object(js))
 
-    def addJS(self, javascript: str) -> None:  # deprecated
-        """
-        .. deprecated:: 1.28.0
-
-            Use :meth:`add_js` instead.
-        """
-        deprecation_with_replacement("addJS", "add_js", "3.0.0")
-        return self.add_js(javascript)
-
-    def add_attachment(self, filename: str, data: Union[str, bytes]) -> None:
+    def add_attachment(self, filename: str, data: Union[str, bytes]) -> "EmbeddedFile":
         """
         Embed a file inside the PDF.
 
         Reference:
-        https://www.adobe.com/content/dam/Adobe/en/devnet/acrobat/pdfs/PDF32000_2008.pdf
+        https://opensource.adobe.com/dc-acrobat-sdk-docs/pdfstandards/PDF32000_2008.pdf
         Section 7.11.3
 
         Args:
-          filename: The filename to display.
-          data: The data in the file.
+            filename: The filename to display.
+            data: The data in the file.
+
+        Returns:
+            EmbeddedFile instance for the newly created embedded file.
+
         """
-        # We need three entries:
-        # * The file's data
-        # * The /Filespec entry
-        # * The file's name, which goes in the Catalog
-
-        # The entry for the file
-        # Sample:
-        # 8 0 obj
-        # <<
-        #  /Length 12
-        #  /Type /EmbeddedFile
-        # >>
-        # stream
-        # Hello world!
-        # endstream
-        # endobj
-
-        file_entry = DecodedStreamObject()
-        file_entry.set_data(data)
-        file_entry.update({NameObject(PA.TYPE): NameObject("/EmbeddedFile")})
-
-        # The Filespec entry
-        # Sample:
-        # 7 0 obj
-        # <<
-        #  /Type /Filespec
-        #  /F (hello.txt)
-        #  /EF << /F 8 0 R >>
-        # >>
-
-        ef_entry = DictionaryObject()
-        ef_entry.update({NameObject("/F"): file_entry})
-
-        filespec = DictionaryObject()
-        filespec.update(
-            {
-                NameObject(PA.TYPE): NameObject("/Filespec"),
-                NameObject(FileSpecificationDictionaryEntries.F): create_string_object(
-                    filename
-                ),  # Perhaps also try TextStringObject
-                NameObject(FileSpecificationDictionaryEntries.EF): ef_entry,
-            }
-        )
-
-        # Then create the entry for the root, as it needs
-        # a reference to the Filespec
-        # Sample:
-        # 1 0 obj
-        # <<
-        #  /Type /Catalog
-        #  /Outlines 2 0 R
-        #  /Pages 3 0 R
-        #  /Names << /EmbeddedFiles << /Names [(hello.txt) 7 0 R] >> >>
-        # >>
-        # endobj
-
-        embedded_files_names_dictionary = DictionaryObject()
-        embedded_files_names_dictionary.update(
-            {
-                NameObject(CA.NAMES): ArrayObject(
-                    [create_string_object(filename), filespec]
-                )
-            }
-        )
-
-        embedded_files_dictionary = DictionaryObject()
-        embedded_files_dictionary.update(
-            {NameObject("/EmbeddedFiles"): embedded_files_names_dictionary}
-        )
-        # Update the root
-        self._root_object.update({NameObject(CA.NAMES): embedded_files_dictionary})
-
-    def addAttachment(self, fname: str, fdata: Union[str, bytes]) -> None:  # deprecated
-        """
-        .. deprecated:: 1.28.0
-
-            Use :meth:`add_attachment` instead.
-        """
-        deprecation_with_replacement("addAttachment", "add_attachment", "3.0.0")
-        return self.add_attachment(fname, fdata)
+        return EmbeddedFile._create_new(self, filename, data)
 
     def append_pages_from_reader(
         self,
@@ -702,19 +813,20 @@ class PdfWriter:
         Copy pages from reader to writer. Includes an optional callback
         parameter which is invoked after pages are appended to the writer.
 
-        `append` should be prefered.
+        ``append`` should be preferred.
 
         Args:
-          reader: a PdfReader object from which to copy page
-            annotations to this writer object.  The writer's annots
-            will then be updated
-          after_page_append:
-            Callback function that is invoked after each page is appended to
-            the writer. Signature includes a reference to the appended page
-            (delegates to append_pages_from_reader). The single parameter of the
-            callback is a reference to the page just appended to the document.
+            reader: a PdfReader object from which to copy page
+                annotations to this writer object. The writer's annots
+                will then be updated.
+            after_page_append:
+                Callback function that is invoked after each page is appended to
+                the writer. Signature includes a reference to the appended page
+                (delegates to append_pages_from_reader). The single parameter of
+                the callback is a reference to the page just appended to the
+                document.
+
         """
-        # Get page count from writer and reader
         reader_num_pages = len(reader.pages)
         # Copy pages from reader to writer
         for reader_page_number in range(reader_num_pages):
@@ -724,26 +836,107 @@ class PdfWriter:
             if callable(after_page_append):
                 after_page_append(writer_page)
 
-    def appendPagesFromReader(
+    def _merge_content_stream_to_page(
         self,
-        reader: PdfReader,
-        after_page_append: Optional[Callable[[PageObject], None]] = None,
-    ) -> None:  # deprecated
+        page: PageObject,
+        new_content_data: bytes,
+    ) -> None:
         """
-        .. deprecated:: 1.28.0
+        Combines existing content stream(s) with new content (as bytes).
 
-            Use :meth:`append_pages_from_reader` instead.
+        Args:
+            page: The page to which the new content data will be added.
+            new_content_data: A binary-encoded new content stream, for
+                instance the commands to draw an XObject.
         """
-        deprecation_with_replacement(
-            "appendPagesFromReader", "append_pages_from_reader", "3.0.0"
-        )
-        self.append_pages_from_reader(reader, after_page_append)
+        # First resolve the existing page content. This always is an IndirectObject:
+        # PDF Explained by John Whitington
+        # https://www.oreilly.com/library/view/pdf-explained/9781449321581/ch04.html
+        if NameObject("/Contents") in page:
+            existing_content_ref = page[NameObject("/Contents")]
+            existing_content = existing_content_ref.get_object()
+
+            if isinstance(existing_content, ArrayObject):
+                # Create a new StreamObject for the new_content_data
+                new_stream_obj = StreamObject()
+                new_stream_obj.set_data(new_content_data)
+                existing_content.append(self._add_object(new_stream_obj))
+                page[NameObject("/Contents")] = self._add_object(existing_content)
+            if isinstance(existing_content, StreamObject):
+                # Merge new content to existing StreamObject
+                merged_data = existing_content.get_data() + b"\n" + new_content_data
+                new_stream = StreamObject()
+                new_stream.set_data(merged_data)
+                page[NameObject("/Contents")] = self._add_object(new_stream)
+        else:
+            # If no existing content, then we have an empty page.
+            # Create a new StreamObject in a new /Contents entry.
+            new_stream = StreamObject()
+            new_stream.set_data(new_content_data)
+            page[NameObject("/Contents")] = self._add_object(new_stream)
+
+    def _add_apstream_object(
+            self,
+            page: PageObject,
+            appearance_stream_obj: StreamObject,
+            object_name: str,
+            x_offset: float,
+            y_offset: float,
+        ) -> None:
+        """
+        Adds an appearance stream to the page content in the form of
+        an XObject.
+
+        Args:
+            page: The page to which to add the appearance stream.
+            appearance_stream_obj: The appearance stream.
+            object_name: The name of the appearance stream.
+            x_offset: The horizontal offset for the appearance stream.
+            y_offset: The vertical offset for the appearance stream.
+        """
+        # Prepare XObject resource dictionary on the page. This currently
+        # only deals with font resources, but can easily be adapted to also
+        # include other resources.
+        pg_res = cast(DictionaryObject, page[PG.RESOURCES])
+        if "/Resources" in appearance_stream_obj:
+            ap_stream_res = cast(DictionaryObject, appearance_stream_obj["/Resources"])
+            ap_stream_font_dict = cast(DictionaryObject, ap_stream_res.get("/Font", DictionaryObject()))
+            if "/Font" not in pg_res:
+                font_dict_ref = self._add_object(DictionaryObject())
+                pg_res[NameObject("/Font")] = font_dict_ref
+            pg_font_res = cast(DictionaryObject, pg_res["/Font"].get_object())
+            # Merge fonts from the appearance stream into the page's font resources
+            for font_name, font_res in ap_stream_font_dict.items():
+                if font_name not in pg_font_res:
+                    font_res_ref = self._add_object(font_res)
+                    pg_font_res[font_name] = font_res_ref
+        # Always add the resolved stream object to the writer to get a new IndirectObject.
+        # This ensures we have a valid IndirectObject managed by *this* writer.
+        xobject_ref = self._add_object(appearance_stream_obj)
+        xobject_name = NameObject(f"/Fm_{object_name}")._sanitize()
+        if "/XObject" not in pg_res:
+            pg_res[NameObject("/XObject")] = DictionaryObject()
+        pg_xo_res  = cast(DictionaryObject, pg_res["/XObject"])
+        if xobject_name not in pg_xo_res:
+            pg_xo_res[xobject_name] = xobject_ref
+        else:
+            logger_warning(
+                f"XObject {xobject_name!r} already added to page resources. This might be an issue.",
+                __name__
+            )
+        xobject_cm = Transformation().translate(x_offset, y_offset)
+        xobject_drawing_commands = f"q\n{xobject_cm._to_cm()}\n{xobject_name} Do\nQ".encode()
+        self._merge_content_stream_to_page(page, xobject_drawing_commands)
+
+    FFBITS_NUL = FA.FfBits(0)
 
     def update_page_form_field_values(
         self,
-        page: PageObject,
-        fields: Dict[str, Any],
-        flags: FieldFlag = OPTIONAL_READ_WRITE_FIELD,
+        page: Union[PageObject, list[PageObject], None],
+        fields: Mapping[str, Union[str, list[str], tuple[str, str, float]]],
+        flags: FA.FfBits = FFBITS_NUL,
+        auto_regenerate: Optional[bool] = True,
+        flatten: bool = False,
     ) -> None:
         """
         Update the form field values for a given page from a fields dictionary.
@@ -752,145 +945,234 @@ class PdfWriter:
         If the field links to a parent object, add the information to the parent.
 
         Args:
-          page: Page reference from PDF writer where the
-            annotations and field data will be updated.
-          fields: a Python dictionary of field names (/T) and text
-            values (/V)
-          flags: An integer (0 to 7). The first bit sets ReadOnly, the
-            second bit sets Required, the third bit sets NoExport. See
-            PDF Reference Table 8.70 for details.
+            page: `PageObject` - references **PDF writer's page** where the
+                annotations and field data will be updated.
+                `List[Pageobject]` - provides list of pages to be processed.
+                `None` - all pages.
+            fields: a Python dictionary of:
+
+                * field names (/T) as keys and text values (/V) as value
+                * field names (/T) as keys and list of text values (/V) for multiple choice list
+                * field names (/T) as keys and tuple of:
+                    * text values (/V)
+                    * font id (e.g. /F1, the font id must exist)
+                    * font size (0 for autosize)
+
+            flags: A set of flags from :class:`~pypdf.constants.FieldDictionaryAttributes.FfBits`.
+
+            auto_regenerate: Set/unset the need_appearances flag;
+                the flag is unchanged if auto_regenerate is None.
+
+            flatten: Whether or not to flatten the annotation. If True, this adds the annotation's
+                appearance stream to the page contents. Note that this option does not remove the
+                annotation itself.
+
         """
-        self.set_need_appearances_writer()
+        if CatalogDictionary.ACRO_FORM not in self._root_object:
+            raise PyPdfError("No /AcroForm dictionary in PDF of PdfWriter Object")
+        acro_form = cast(DictionaryObject, self._root_object[CatalogDictionary.ACRO_FORM])
+        if InteractiveFormDictEntries.Fields not in acro_form:
+            raise PyPdfError("No /Fields dictionary in PDF of PdfWriter Object")
+        if isinstance(auto_regenerate, bool):
+            self.set_need_appearances_writer(auto_regenerate)
         # Iterate through pages, update field values
+        if page is None:
+            page = list(self.pages)
+        if isinstance(page, list):
+            for p in page:
+                if PG.ANNOTS in p:  # just to prevent warnings
+                    self.update_page_form_field_values(p, fields, flags, None, flatten=flatten)
+            return
         if PG.ANNOTS not in page:
             logger_warning("No fields to update on this page", __name__)
             return
-        for j in range(len(page[PG.ANNOTS])):  # type: ignore
-            writer_annot = page[PG.ANNOTS][j].get_object()  # type: ignore
-            # retrieve parent field values, if present
-            writer_parent_annot = {}  # fallback if it's not there
-            if PG.PARENT in writer_annot:
-                writer_parent_annot = writer_annot[PG.PARENT]
-            for field in fields:
-                if writer_annot.get(FieldDictionaryAttributes.T) == field:
-                    if writer_annot.get(FieldDictionaryAttributes.FT) == "/Btn":
-                        writer_annot.update(
-                            {
-                                NameObject(
-                                    AnnotationDictionaryAttributes.AS
-                                ): NameObject(fields[field])
-                            }
-                        )
-                    writer_annot.update(
-                        {
-                            NameObject(FieldDictionaryAttributes.V): TextStringObject(
-                                fields[field]
-                            )
-                        }
-                    )
-                    if flags:
-                        writer_annot.update(
-                            {
-                                NameObject(FieldDictionaryAttributes.Ff): NumberObject(
-                                    flags
-                                )
-                            }
-                        )
-                elif writer_parent_annot.get(FieldDictionaryAttributes.T) == field:
-                    writer_parent_annot.update(
-                        {
-                            NameObject(FieldDictionaryAttributes.V): TextStringObject(
-                                fields[field]
-                            )
-                        }
-                    )
+        appearance_stream_obj: Optional[StreamObject] = None
 
-    def updatePageFormFieldValues(
-        self,
-        page: PageObject,
-        fields: Dict[str, Any],
-        flags: FieldFlag = OPTIONAL_READ_WRITE_FIELD,
-    ) -> None:  # deprecated
-        """
-        .. deprecated:: 1.28.0
+        for annotation in page[PG.ANNOTS]:  # type: ignore
+            annotation = cast(DictionaryObject, annotation.get_object())
+            if annotation.get("/Subtype", "") != "/Widget":
+                continue
+            if "/FT" in annotation and "/T" in annotation:
+                parent_annotation = annotation
+            else:
+                parent_annotation = annotation.get(
+                    PG.PARENT, DictionaryObject()
+                ).get_object()
 
-            Use :meth:`update_page_form_field_values` instead.
+            for field, value in fields.items():
+                rectangle = cast(RectangleObject, annotation[AA.Rect])
+                if not (
+                    self._get_qualified_field_name(parent_annotation) == field
+                    or parent_annotation.get("/T", None) == field
+                ):
+                    continue
+                if (
+                    parent_annotation.get("/FT", None) == "/Ch"
+                    and "/I" in parent_annotation
+                ):
+                    del parent_annotation["/I"]
+                if flags:
+                    annotation[NameObject(FA.Ff)] = NumberObject(flags)
+                # Set the field value
+                if not (value is None and flatten):  # Only change values if given by user and not flattening.
+                    if isinstance(value, list):
+                        lst = ArrayObject(TextStringObject(v) for v in value)
+                        parent_annotation[NameObject(FA.V)] = lst
+                    elif isinstance(value, tuple):
+                        annotation[NameObject(FA.V)] = TextStringObject(
+                            value[0],
+                        )
+                    else:
+                        parent_annotation[NameObject(FA.V)] = TextStringObject(value)
+                # Get or create the field's appearance stream object
+                if parent_annotation.get(FA.FT) == "/Btn":
+                    # Checkbox button (no /FT found in Radio widgets);
+                    # We can find the associated appearance stream object
+                    # within the annotation.
+                    v = NameObject(value)
+                    ap = cast(DictionaryObject, annotation[NameObject(AA.AP)])
+                    normal_ap = cast(DictionaryObject, ap["/N"])
+                    if v not in normal_ap:
+                        v = NameObject("/Off")
+                    appearance_stream_obj = normal_ap.get(v)
+                    # Other cases will be updated through the for loop
+                    annotation[NameObject(AA.AS)] = v
+                    annotation[NameObject(FA.V)] = v
+                elif (
+                    parent_annotation.get(FA.FT) == "/Tx"
+                    or parent_annotation.get(FA.FT) == "/Ch"
+                ):
+                    # Textbox; we need to generate the appearance stream object
+                    if isinstance(value, tuple):
+                        appearance_stream_obj = TextStreamAppearance.from_text_annotation(
+                            acro_form, parent_annotation, annotation, value[1], value[2]
+                        )
+                    else:
+                        appearance_stream_obj = TextStreamAppearance.from_text_annotation(
+                            acro_form, parent_annotation, annotation
+                        )
+                    # Add the appearance stream object
+                    if AA.AP not in annotation:
+                        annotation[NameObject(AA.AP)] = DictionaryObject(
+                            {NameObject("/N"): self._add_object(appearance_stream_obj)}
+                        )
+                    elif "/N" not in (ap:= cast(DictionaryObject, annotation[AA.AP])):
+                        cast(DictionaryObject, annotation[NameObject(AA.AP)])[
+                            NameObject("/N")
+                        ] = self._add_object(appearance_stream_obj)
+                    else:  # [/AP][/N] exists
+                        n = annotation[AA.AP]["/N"].indirect_reference.idnum  # type: ignore
+                        self._objects[n - 1] = appearance_stream_obj
+                        appearance_stream_obj.indirect_reference = IndirectObject(n, 0, self)
+                elif (
+                    annotation.get(FA.FT) == "/Sig"
+                ):  # deprecated  # not implemented yet
+                    logger_warning("Signature forms not implemented yet", __name__)
+                if flatten and appearance_stream_obj is not None:
+                    self._add_apstream_object(page, appearance_stream_obj, field, rectangle[0], rectangle[1])
+
+    def reattach_fields(
+        self, page: Optional[PageObject] = None
+    ) -> list[DictionaryObject]:
         """
-        deprecation_with_replacement(
-            "updatePageFormFieldValues", "update_page_form_field_values", "3.0.0"
-        )
-        return self.update_page_form_field_values(page, fields, flags)
+        Parse annotations within the page looking for orphan fields and
+        reattach then into the Fields Structure.
+
+        Args:
+            page: page to analyze.
+                  If none is provided, all pages will be analyzed.
+
+        Returns:
+            list of reattached fields.
+
+        """
+        lst = []
+        if page is None:
+            for p in self.pages:
+                lst += self.reattach_fields(p)
+            return lst
+
+        try:
+            af = cast(DictionaryObject, self._root_object[CatalogDictionary.ACRO_FORM])
+        except KeyError:
+            af = DictionaryObject()
+            self._root_object[NameObject(CatalogDictionary.ACRO_FORM)] = af
+        try:
+            fields = cast(ArrayObject, af[InteractiveFormDictEntries.Fields])
+        except KeyError:
+            fields = ArrayObject()
+            af[NameObject(InteractiveFormDictEntries.Fields)] = fields
+
+        if "/Annots" not in page:
+            return lst
+        annotations = cast(ArrayObject, page["/Annots"])
+        for idx, annotation in enumerate(annotations):
+            is_indirect = isinstance(annotation, IndirectObject)
+            annotation = cast(DictionaryObject, annotation.get_object())
+            if annotation.get("/Subtype", "") == "/Widget" and "/FT" in annotation:
+                if (
+                    "indirect_reference" in annotation.__dict__
+                    and annotation.indirect_reference in fields
+                ):
+                    continue
+                if not is_indirect:
+                    annotations[idx] = self._add_object(annotation)
+                fields.append(annotation.indirect_reference)
+                lst.append(annotation)
+        return lst
 
     def clone_reader_document_root(self, reader: PdfReader) -> None:
         """
-        Copy the reader document root to the writer and all sub elements,
-        including pages, threads, outlines,...
-        For partial insertion, `append` should be considered.
+        Copy the reader document root to the writer and all sub-elements,
+        including pages, threads, outlines,... For partial insertion, ``append``
+        should be considered.
 
         Args:
-          reader: PdfReader from the document root should be copied.
+            reader: PdfReader from which the document root should be copied.
+
         """
-        self._root_object = cast(DictionaryObject, reader.trailer[TK.ROOT].clone(self))
-        self._root = self._root_object.indirect_reference  # type: ignore[assignment]
+        self._info_obj = None
+        if self.incremental:
+            self._objects = [None] * (cast(int, reader.trailer["/Size"]) - 1)
+            for i in range(len(self._objects)):
+                o = reader.get_object(i + 1)
+                if o is not None:
+                    self._objects[i] = o.replicate(self)
+        else:
+            self._objects.clear()
+        self._root_object = reader.root_object.clone(self)
         self._pages = self._root_object.raw_get("/Pages")
-        self._flatten()
-        self._root_object[NameObject("/Pages")][  # type: ignore[index]
-            NameObject("/Kids")
-        ] = self.flattened_pages
-        del self.flattened_pages
 
-    def cloneReaderDocumentRoot(self, reader: PdfReader) -> None:  # deprecated
-        """
-        .. deprecated:: 1.28.0
-
-            Use :meth:`clone_reader_document_root` instead.
-        """
-        deprecation_with_replacement(
-            "cloneReaderDocumentRoot", "clone_reader_document_root", "3.0.0"
-        )
-        self.clone_reader_document_root(reader)
-
-    def _flatten(
-        self,
-        pages: Union[None, DictionaryObject, PageObject] = None,
-        inherit: Optional[Dict[str, Any]] = None,
-        indirect_reference: Optional[IndirectObject] = None,
-    ) -> None:
-        inheritable_page_attributes = (
-            NameObject(PG.RESOURCES),
-            NameObject(PG.MEDIABOX),
-            NameObject(PG.CROPBOX),
-            NameObject(PG.ROTATE),
-        )
-        if inherit is None:
-            inherit = {}
-        if pages is None:
-            pages = cast(DictionaryObject, self._root_object["/Pages"])
-            self.flattened_pages = ArrayObject()
-        assert pages is not None  # hint for mypy
-        t = "/Pages"
-        if PA.TYPE in pages:
-            t = cast(str, pages[PA.TYPE])
-
-        if t == "/Pages":
-            for attr in inheritable_page_attributes:
-                if attr in pages:
-                    inherit[attr] = pages[attr]
-            for page in cast(ArrayObject, cast(DictionaryObject, pages)[PA.KIDS]):
-                addt = {}
-                if isinstance(page, IndirectObject):
-                    addt["indirect_reference"] = page
-                self._flatten(page.get_object(), inherit, **addt)
-        elif t == "/Page":
-            for attr_in, value in list(inherit.items()):
-                # if the page has it's own value, it does not inherit the
-                # parent's value:
-                if attr_in not in pages:
-                    pages[attr_in] = value
-            pages[NameObject("/Parent")] = cast(
-                IndirectObject, self._root_object.raw_get("/Pages")
+        if len(self._objects) > cast(int, reader.trailer["/Size"]):
+            if self.strict:
+                raise PdfReadError(
+                    f"Object count {len(self._objects)} exceeds defined trailer size {reader.trailer['/Size']}"
+                )
+            logger_warning(
+                f"Object count {len(self._objects)} exceeds defined trailer size {reader.trailer['/Size']}",
+                __name__
             )
-            self.flattened_pages.append(indirect_reference)
+
+        # must be done here before rewriting
+        if self.incremental:
+            self._original_hash = [
+                (obj.hash_bin() if obj is not None else 0) for obj in self._objects
+            ]
+
+        try:
+            self._flatten()
+        except IndexError:
+            raise PdfReadError("Got index error while flattening.")
+
+        assert self.flattened_pages is not None
+        for p in self.flattened_pages:
+            self._replace_object(cast(IndirectObject, p.indirect_reference).idnum, p)
+            if not self.incremental:
+                p[NameObject("/Parent")] = self._pages
+        if not self.incremental:
+            cast(DictionaryObject, self._pages.get_object())[
+                NameObject("/Kids")
+            ] = ArrayObject([p.indirect_reference for p in self.flattened_pages])
 
     def clone_document_from_reader(
         self,
@@ -898,392 +1180,477 @@ class PdfWriter:
         after_page_append: Optional[Callable[[PageObject], None]] = None,
     ) -> None:
         """
-        Create a copy (clone) of a document from a PDF file reader
-        cloning section '/Root' and '/Info' and '/ID' of the pdf
+        Create a copy (clone) of a document from a PDF file reader cloning
+        section '/Root' and '/Info' and '/ID' of the pdf.
 
         Args:
-          reader: PDF file reader instance from which the clone
-            should be created.
-          after_page_append:
-            Callback function that is invoked after each page is appended to
-            the writer. Signature includes a reference to the appended page
-            (delegates to append_pages_from_reader). The single parameter of the
-            callback is a reference to the page just appended to the document.
+            reader: PDF file reader instance from which the clone
+                should be created.
+            after_page_append:
+                Callback function that is invoked after each page is appended to
+                the writer. Signature includes a reference to the appended page
+                (delegates to append_pages_from_reader). The single parameter of
+                the callback is a reference to the page just appended to the
+                document.
+
         """
         self.clone_reader_document_root(reader)
-        self._info = reader.trailer[TK.INFO].clone(self).indirect_reference  # type: ignore
+        inf = reader._info
+        if self.incremental:
+            if inf is not None:
+                self._info_obj = cast(
+                    IndirectObject, inf.clone(self).indirect_reference
+                )
+                assert isinstance(self._info, DictionaryObject), "for mypy"
+                self._original_hash[
+                    self._info_obj.indirect_reference.idnum - 1
+                ] = self._info.hash_bin()
+        elif inf is not None:
+            self._info_obj = self._add_object(
+                DictionaryObject(cast(DictionaryObject, inf.get_object()))
+            )
+        # else: _info_obj = None done in clone_reader_document_root()
+
         try:
-            self._ID = reader.trailer[TK.ID].clone(self)  # type: ignore
-        except KeyError:
+            self._ID = cast(ArrayObject, reader._ID).clone(self)
+        except AttributeError:
             pass
+
         if callable(after_page_append):
             for page in cast(
                 ArrayObject, cast(DictionaryObject, self._pages.get_object())["/Kids"]
             ):
                 after_page_append(page.get_object())
 
-    def cloneDocumentFromReader(
-        self,
-        reader: PdfReader,
-        after_page_append: Optional[Callable[[PageObject], None]] = None,
-    ) -> None:  # deprecated
-        """
-        .. deprecated:: 1.28.0
+    def _compute_document_identifier(self) -> ByteStringObject:
+        stream = BytesIO()
+        self._write_pdf_structure(stream)
+        stream.seek(0)
+        return ByteStringObject(_rolling_checksum(stream).encode("utf8"))
 
-            Use :meth:`clone_document_from_reader` instead.
+    def generate_file_identifiers(self) -> None:
         """
-        deprecation_with_replacement(
-            "cloneDocumentFromReader", "clone_document_from_reader", "3.0.0"
-        )
-        self.clone_document_from_reader(reader, after_page_append)
+        Generate an identifier for the PDF that will be written.
+
+        The only point of this is ensuring uniqueness. Reproducibility is not
+        required.
+        When a file is first written, both identifiers shall be set to the same value.
+        If both identifiers match when a file reference is resolved, it is very
+        likely that the correct and unchanged file has been found. If only the first
+        identifier matches, a different version of the correct file has been found.
+        see §14.4 "File Identifiers".
+        """
+        if self._ID:
+            id1 = self._ID[0]
+            id2 = self._compute_document_identifier()
+        else:
+            id1 = self._compute_document_identifier()
+            id2 = id1
+        self._ID = ArrayObject((id1, id2))
 
     def encrypt(
         self,
-        user_password: Optional[str] = None,
+        user_password: str,
         owner_password: Optional[str] = None,
         use_128bit: bool = True,
         permissions_flag: UserAccessPermissions = ALL_DOCUMENT_PERMISSIONS,
-        user_pwd: Optional[str] = None,  # deprecated
-        owner_pwd: Optional[str] = None,  # deprecated
+        *,
+        algorithm: Optional[str] = None,
     ) -> None:
         """
         Encrypt this PDF file with the PDF Standard encryption handler.
 
         Args:
-          user_password: The password which allows for opening
-            and reading the PDF file with the restrictions provided.
-          owner_password: The password which allows for
-            opening the PDF files without any restrictions.  By default,
-            the owner password is the same as the user password.
-          use_128bit: flag as to whether to use 128bit
-            encryption.  When false, 40bit encryption will be used.  By default,
-            this flag is on.
-          permissions_flag: permissions as described in
-            TABLE 3.20 of the PDF 1.7 specification. A bit value of 1 means the
-            permission is grantend. Hence an integer value of -1 will set all
-            flags.
-            Bit position 3 is for printing, 4 is for modifying content, 5 and 6
-            control annotations, 9 for form fields, 10 for extraction of
-            text and graphics.
+            user_password: The password which allows for opening
+                and reading the PDF file with the restrictions provided.
+            owner_password: The password which allows for
+                opening the PDF files without any restrictions. By default,
+                the owner password is the same as the user password.
+            use_128bit: flag as to whether to use 128bit
+                encryption. When false, 40bit encryption will be used.
+                By default, this flag is on.
+            permissions_flag: permissions as described in
+                Table 3.20 of the PDF 1.7 specification. A bit value of 1 means
+                the permission is granted.
+                Hence an integer value of -1 will set all flags.
+                Bit position 3 is for printing, 4 is for modifying content,
+                5 and 6 control annotations, 9 for form fields,
+                10 for extraction of text and graphics.
+            algorithm: encrypt algorithm. Values may be one of "RC4-40", "RC4-128",
+                "AES-128", "AES-256-R5", "AES-256". If it is valid,
+                `use_128bit` will be ignored.
+
         """
-        if user_pwd is not None:
-            if user_password is not None:
-                raise ValueError(
-                    "Please only set 'user_password'. "
-                    "The 'user_pwd' argument is deprecated."
-                )
-            else:
-                warnings.warn(
-                    "Please use 'user_password' instead of 'user_pwd'. "
-                    "The 'user_pwd' argument is deprecated and "
-                    "will be removed in pypdf 4.0.0."
-                )
-                user_password = user_pwd
-        if user_password is None:  # deprecated
-            # user_password is only Optional for due to the deprecated user_pwd
-            raise ValueError("user_password may not be None")
-
-        if owner_pwd is not None:  # deprecated
-            if owner_password is not None:
-                raise ValueError(
-                    "The argument owner_pwd of encrypt is deprecated. "
-                    "Use owner_password only."
-                )
-            else:
-                old_term = "owner_pwd"
-                new_term = "owner_password"
-                warnings.warn(
-                    message=(
-                        f"{old_term} is deprecated as an argument and will be "
-                        f"removed in pypdf 4.0.0. Use {new_term} instead"
-                    ),
-                    category=DeprecationWarning,
-                )
-                owner_password = owner_pwd
-
         if owner_password is None:
             owner_password = user_password
-        if use_128bit:
-            V = 2
-            rev = 3
-            keylen = int(128 / 8)
+
+        if algorithm is not None:
+            try:
+                alg = getattr(EncryptAlgorithm, algorithm.replace("-", "_"))
+            except AttributeError:
+                raise ValueError(f"Algorithm '{algorithm}' NOT supported")
         else:
-            V = 1
-            rev = 2
-            keylen = int(40 / 8)
-        P = permissions_flag
-        O = ByteStringObject(_alg33(owner_password, user_password, rev, keylen))  # type: ignore[arg-type]
-        ID_1 = ByteStringObject(md5((repr(time.time())).encode("utf8")).digest())
-        ID_2 = ByteStringObject(md5((repr(random.random())).encode("utf8")).digest())
-        self._ID = ArrayObject((ID_1, ID_2))
-        if rev == 2:
-            U, key = _alg34(user_password, O, P, ID_1)
+            alg = EncryptAlgorithm.RC4_128
+            if not use_128bit:
+                alg = EncryptAlgorithm.RC4_40
+        self.generate_file_identifiers()
+        assert self._ID
+        self._encryption = Encryption.make(alg, permissions_flag, self._ID[0])
+        # in case call `encrypt` again
+        entry = self._encryption.write_entry(user_password, owner_password)
+        if self._encrypt_entry:
+            # replace old encrypt_entry
+            assert self._encrypt_entry.indirect_reference is not None
+            entry.indirect_reference = self._encrypt_entry.indirect_reference
+            self._objects[entry.indirect_reference.idnum - 1] = entry
         else:
-            assert rev == 3
-            U, key = _alg35(user_password, rev, keylen, O, P, ID_1, False)  # type: ignore[arg-type]
-        encrypt = DictionaryObject()
-        encrypt[NameObject(SA.FILTER)] = NameObject("/Standard")
-        encrypt[NameObject("/V")] = NumberObject(V)
-        if V == 2:
-            encrypt[NameObject(SA.LENGTH)] = NumberObject(keylen * 8)
-        encrypt[NameObject(ED.R)] = NumberObject(rev)
-        encrypt[NameObject(ED.O)] = ByteStringObject(O)
-        encrypt[NameObject(ED.U)] = ByteStringObject(U)
-        encrypt[NameObject(ED.P)] = NumberObject(P)
-        self._encrypt = self._add_object(encrypt)
-        self._encrypt_key = key
+            self._add_object(entry)
+        self._encrypt_entry = entry
+
+    def _resolve_links(self) -> None:
+        """Patch up links that were added to the document earlier, to
+        make sure they still point to the same pages.
+        """
+        for (new_link, old_link) in self._unresolved_links:
+            old_page = old_link.find_referenced_page()
+            if not old_page:
+                continue
+            new_page = self._merged_in_pages.get(old_page)
+            if new_page is None:
+                continue
+            new_link.patch_reference(self, new_page)
 
     def write_stream(self, stream: StreamType) -> None:
         if hasattr(stream, "mode") and "b" not in stream.mode:
             logger_warning(
-                f"File <{stream.name}> to write to is not in binary mode. "  # type: ignore
+                f"File <{stream.name}> to write to is not in binary mode. "
                 "It may not be written to correctly.",
                 __name__,
             )
+        self._resolve_links()
 
-        if not self._root:
-            self._root = self._add_object(self._root_object)
+        if self.incremental:
+            self._reader.stream.seek(0)
+            stream.write(self._reader.stream.read(-1))
+            if len(self.list_objects_in_increment()) > 0:
+                self._write_increment(stream)  # writes objs, xref stream and startxref
+        else:
+            object_positions, free_objects = self._write_pdf_structure(stream)
+            xref_location = self._write_xref_table(
+                stream, object_positions, free_objects
+            )
+            self._write_trailer(stream, xref_location)
 
-        # PDF objects sometimes have circular references to their /Page objects
-        # inside their object tree (for example, annotations).  Those will be
-        # indirect references to objects that we've recreated in this PDF.  To
-        # address this problem, PageObject's store their original object
-        # reference number, and we add it to the external reference map before
-        # we sweep for indirect references.  This forces self-page-referencing
-        # trees to reference the correct new object location, rather than
-        # copying in a new copy of the page object.
-        self._sweep_indirect_references(self._root)
-
-        object_positions = self._write_header(stream)
-        xref_location = self._write_xref_table(stream, object_positions)
-        self._write_trailer(stream)
-        stream.write(b_(f"\nstartxref\n{xref_location}\n%%EOF\n"))  # eof
-
-    def write(self, stream: Union[Path, StrByteType]) -> Tuple[bool, IO]:
+    def write(self, stream: Union[Path, StrByteType]) -> tuple[bool, IO[Any]]:
         """
         Write the collection of pages added to this object out as a PDF file.
 
         Args:
-          stream: An object to write the file to.  The object can support
-            the write method and the tell method, similar to a file object, or
-            be a file path, just like the fileobj, just named it stream to keep
-            existing workflow.
+            stream: An object to write the file to. The object can support
+                the write method and the tell method, similar to a file object, or
+                be a file path, just like the fileobj, just named it stream to keep
+                existing workflow.
 
         Returns:
-            A tuple (bool, IO)
+            A tuple (bool, IO).
+
         """
         my_file = False
 
         if stream == "":
-            raise ValueError(f"Output(stream={stream}) is empty.")
+            raise ValueError(f"Output({stream=}) is empty.")
 
         if isinstance(stream, (str, Path)):
             stream = FileIO(stream, "wb")
-            self.with_as_usage = True  #
             my_file = True
 
         self.write_stream(stream)
 
-        if self.with_as_usage:
+        if my_file:
             stream.close()
+        else:
+            stream.flush()
 
         return my_file, stream
 
-    def _write_header(self, stream: StreamType) -> List[int]:
-        object_positions = []
-        stream.write(self.pdf_header + b"\n")
-        stream.write(b"%\xE2\xE3\xCF\xD3\n")
-        for i, obj in enumerate(self._objects):
-            obj = self._objects[i]
-            # If the obj is None we can't write anything
-            if obj is not None:
-                idnum = i + 1
-                object_positions.append(stream.tell())
-                stream.write(b_(str(idnum)) + b" 0 obj\n")
-                key = None
-                if hasattr(self, "_encrypt") and idnum != self._encrypt.idnum:
-                    pack1 = struct.pack("<i", i + 1)[:3]
-                    pack2 = struct.pack("<i", 0)[:2]
-                    key = self._encrypt_key + pack1 + pack2
-                    assert len(key) == (len(self._encrypt_key) + 5)
-                    md5_hash = md5(key).digest()
-                    key = md5_hash[: min(16, len(self._encrypt_key) + 5)]
-                obj.write_to_stream(stream, key)
-                stream.write(b"\nendobj\n")
-        return object_positions
+    def list_objects_in_increment(self) -> list[IndirectObject]:
+        """
+        For analysis or debugging.
+        Provides the list of new or modified objects that will be written
+        in the increment.
+        Deleted objects will not be freed but will become orphans.
 
-    def _write_xref_table(self, stream: StreamType, object_positions: List[int]) -> int:
+        Returns:
+            List of new or modified IndirectObjects
+
+        """
+        original_hash_count = len(self._original_hash)
+        return [
+            cast(IndirectObject, obj).indirect_reference
+            for i, obj in enumerate(self._objects)
+            if (
+                obj is not None
+                and (
+                    i >= original_hash_count
+                    or obj.hash_bin() != self._original_hash[i]
+                )
+            )
+        ]
+
+    def _write_increment(self, stream: StreamType) -> None:
+        object_positions = {}
+        object_blocks = []
+        current_start = -1
+        current_stop = -2
+        original_hash_count = len(self._original_hash)
+        for i, obj in enumerate(self._objects):
+            if obj is not None and (
+                i >= original_hash_count
+                or obj.hash_bin() != self._original_hash[i]
+            ):
+                idnum = i + 1
+                assert isinstance(obj, PdfObject), "mypy"
+                # first write new/modified object
+                object_positions[idnum] = stream.tell()
+                stream.write(f"{idnum} 0 obj\n".encode())
+                """ encryption is not operational
+                if self._encryption and obj != self._encrypt_entry:
+                    obj = self._encryption.encrypt_object(obj, idnum, 0)
+                """
+                obj.write_to_stream(stream)
+                stream.write(b"\nendobj\n")
+
+                # prepare xref
+                if idnum != current_stop:
+                    if current_start > 0:
+                        object_blocks.append(
+                            [current_start, current_stop - current_start]
+                        )
+                    current_start = idnum
+                current_stop = idnum + 1
+        assert current_start > 0, "for pytest only"
+        object_blocks.append([current_start, current_stop - current_start])
+        # write incremented xref
+        xref_location = stream.tell()
+        xr_id = len(self._objects) + 1
+        stream.write(f"{xr_id} 0 obj".encode())
+        init_data = {
+            NameObject("/Type"): NameObject("/XRef"),
+            NameObject("/Size"): NumberObject(xr_id + 1),
+            NameObject("/Root"): self.root_object.indirect_reference,
+            NameObject("/Filter"): NameObject("/FlateDecode"),
+            NameObject("/Index"): ArrayObject(
+                [NumberObject(_it) for _su in object_blocks for _it in _su]
+            ),
+            NameObject("/W"): ArrayObject(
+                [NumberObject(1), NumberObject(4), NumberObject(1)]
+            ),
+            "__streamdata__": b"",
+        }
+        if self._info is not None and (
+            self._info.indirect_reference.idnum - 1  # type: ignore
+            >= len(self._original_hash)
+            or cast(IndirectObject, self._info).hash_bin()  # kept for future
+            != self._original_hash[
+                self._info.indirect_reference.idnum - 1  # type: ignore
+            ]
+        ):
+            init_data[NameObject(TK.INFO)] = self._info.indirect_reference
+        init_data[NameObject(TK.PREV)] = NumberObject(self._reader._startxref)
+        if self._ID:
+            init_data[NameObject(TK.ID)] = self._ID
+        xr = StreamObject.initialize_from_dictionary(init_data)
+        xr.set_data(
+            b"".join(
+                [struct.pack(b">BIB", 1, _pos, 0) for _pos in object_positions.values()]
+            )
+        )
+        xr.write_to_stream(stream)
+        stream.write(f"\nendobj\nstartxref\n{xref_location}\n%%EOF\n".encode())  # eof
+
+    def _write_pdf_structure(self, stream: StreamType) -> tuple[list[int], list[int]]:
+        object_positions = []
+        free_objects = []
+        stream.write(self.pdf_header.encode() + b"\n")
+        stream.write(b"%\xE2\xE3\xCF\xD3\n")
+
+        for idnum, obj in enumerate(self._objects, start=1):
+            if obj is not None:
+                object_positions.append(stream.tell())
+                stream.write(f"{idnum} 0 obj\n".encode())
+                if self._encryption and obj != self._encrypt_entry:
+                    obj = self._encryption.encrypt_object(obj, idnum, 0)
+                obj.write_to_stream(stream)
+                stream.write(b"\nendobj\n")
+            else:
+                object_positions.append(-1)
+                free_objects.append(idnum)
+        free_objects.append(0)  # add 0 to loop in accordance with specification
+        return object_positions, free_objects
+
+    def _write_xref_table(
+        self, stream: StreamType, object_positions: list[int], free_objects: list[int]
+    ) -> int:
         xref_location = stream.tell()
         stream.write(b"xref\n")
-        stream.write(b_(f"0 {len(self._objects) + 1}\n"))
-        stream.write(b_(f"{0:0>10} {65535:0>5} f \n"))
+        stream.write(f"0 {len(self._objects) + 1}\n".encode())
+        stream.write(f"{free_objects[0]:0>10} {65535:0>5} f \n".encode())
+        free_idx = 1
         for offset in object_positions:
-            stream.write(b_(f"{offset:0>10} {0:0>5} n \n"))
+            if offset > 0:
+                stream.write(f"{offset:0>10} {0:0>5} n \n".encode())
+            else:
+                stream.write(f"{free_objects[free_idx]:0>10} {1:0>5} f \n".encode())
+                free_idx += 1
         return xref_location
 
-    def _write_trailer(self, stream: StreamType) -> None:
+    def _write_trailer(self, stream: StreamType, xref_location: int) -> None:
+        """
+        Write the PDF trailer to the stream.
+
+        To quote the PDF specification:
+            [The] trailer [gives] the location of the cross-reference table and
+            of certain special objects within the body of the file.
+        """
         stream.write(b"trailer\n")
-        trailer = DictionaryObject()
-        trailer.update(
+        trailer = DictionaryObject(
             {
                 NameObject(TK.SIZE): NumberObject(len(self._objects) + 1),
-                NameObject(TK.ROOT): self._root,
-                NameObject(TK.INFO): self._info,
+                NameObject(TK.ROOT): self.root_object.indirect_reference,
             }
         )
-        if hasattr(self, "_ID"):
+        if self._info is not None:
+            trailer[NameObject(TK.INFO)] = self._info.indirect_reference
+        if self._ID is not None:
             trailer[NameObject(TK.ID)] = self._ID
-        if hasattr(self, "_encrypt"):
-            trailer[NameObject(TK.ENCRYPT)] = self._encrypt
-        trailer.write_to_stream(stream, None)
+        if self._encrypt_entry:
+            trailer[NameObject(TK.ENCRYPT)] = self._encrypt_entry.indirect_reference
+        trailer.write_to_stream(stream)
+        stream.write(f"\nstartxref\n{xref_location}\n%%EOF\n".encode())  # eof
 
-    def add_metadata(self, infos: Dict[str, Any]) -> None:
+    @property
+    def metadata(self) -> Optional[DocumentInformation]:
+        """
+        Retrieve/set the PDF file's document information dictionary, if it exists.
+
+        Args:
+            value: dict with the entries to be set. if None : remove the /Info entry from the pdf.
+
+        Note that some PDF files use (XMP) metadata streams instead of document
+        information dictionaries, and these metadata streams will not be
+        accessed by this function, but by :meth:`~xmp_metadata`.
+
+        """
+        return super().metadata
+
+    @metadata.setter
+    def metadata(
+        self,
+        value: Optional[Union[DocumentInformation, DictionaryObject, dict[Any, Any]]],
+    ) -> None:
+        if value is None:
+            self._info = None
+        else:
+            if self._info is not None:
+                self._info.clear()
+
+            self.add_metadata(value)
+
+    def add_metadata(self, infos: dict[str, Any]) -> None:
         """
         Add custom metadata to the output.
 
         Args:
-          infos: a Python dictionary where each key is a field
-            and each value is your new metadata.
+            infos: a Python dictionary where each key is a field
+                and each value is your new metadata.
+
         """
         args = {}
+        if isinstance(infos, PdfObject):
+            infos = cast(DictionaryObject, infos.get_object())
         for key, value in list(infos.items()):
-            args[NameObject(key)] = create_string_object(value)
-        self.get_object(self._info).update(args)  # type: ignore
+            if isinstance(value, PdfObject):
+                value = value.get_object()
+            args[NameObject(key)] = create_string_object(str(value))
+        if self._info is None:
+            self._info = DictionaryObject()
+        self._info.update(args)
 
-    def addMetadata(self, infos: Dict[str, Any]) -> None:  # deprecated
-        """
-        .. deprecated:: 1.28.0
-
-            Use :meth:`add_metadata` instead.
-        """
-        deprecation_with_replacement("addMetadata", "add_metadata", "3.0.0")
-        self.add_metadata(infos)
-
-    def _sweep_indirect_references(
+    def compress_identical_objects(
         self,
-        root: Union[
-            ArrayObject,
-            BooleanObject,
-            DictionaryObject,
-            FloatObject,
-            IndirectObject,
-            NameObject,
-            PdfObject,
-            NumberObject,
-            TextStringObject,
-            NullObject,
-        ],
+        remove_identicals: bool = True,
+        remove_orphans: bool = True,
     ) -> None:
-        stack: Deque[
-            Tuple[
-                Any,
-                Optional[Any],
-                Any,
-                List[PdfObject],
-            ]
-        ] = collections.deque()
-        discovered = []
-        parent = None
-        grant_parents: List[PdfObject] = []
-        key_or_id = None
-
-        # Start from root
-        stack.append((root, parent, key_or_id, grant_parents))
-
-        while len(stack):
-            data, parent, key_or_id, grant_parents = stack.pop()
-
-            # Build stack for a processing depth-first
-            if isinstance(data, (ArrayObject, DictionaryObject)):
-                for key, value in data.items():
-                    stack.append(
-                        (
-                            value,
-                            data,
-                            key,
-                            grant_parents + [parent] if parent is not None else [],
-                        )
-                    )
-            elif isinstance(data, IndirectObject):
-                if data.pdf != self:
-                    data = self._resolve_indirect_object(data)
-
-                    if str(data) not in discovered:
-                        discovered.append(str(data))
-                        stack.append((data.get_object(), None, None, []))
-
-            # Check if data has a parent and if it is a dict or
-            # an array update the value
-            if isinstance(parent, (DictionaryObject, ArrayObject)):
-                if isinstance(data, StreamObject):
-                    # a dictionary value is a stream.  streams must be indirect
-                    # objects, so we need to change this value.
-                    data = self._resolve_indirect_object(self._add_object(data))
-
-                update_hashes = []
-
-                # Data changed and thus the hash value changed
-                if parent[key_or_id] != data:
-                    update_hashes = [parent.hash_value()] + [
-                        grant_parent.hash_value() for grant_parent in grant_parents
-                    ]
-                    parent[key_or_id] = data
-
-                # Update old hash value to new hash value
-                for old_hash in update_hashes:
-                    indirect_reference = self._idnum_hash.pop(old_hash, None)
-
-                    if indirect_reference is not None:
-                        indirect_reference_obj = indirect_reference.get_object()
-
-                        if indirect_reference_obj is not None:
-                            self._idnum_hash[
-                                indirect_reference_obj.hash_value()
-                            ] = indirect_reference
-
-    def _resolve_indirect_object(self, data: IndirectObject) -> IndirectObject:
         """
-        Resolves indirect object to this pdf indirect objects.
-
-        If it is a new object then it is added to self._objects
-        and new idnum is given and generation is always 0.
+        Parse the PDF file and merge objects that have the same hash.
+        This will make objects common to multiple pages.
+        Recommended to be used just before writing output.
 
         Args:
-          data:
+            remove_identicals: Remove identical objects.
+            remove_orphans: Remove unreferenced objects.
 
-        Returns:
-          The resolved indirect object
         """
-        if hasattr(data.pdf, "stream") and data.pdf.stream.closed:
-            raise ValueError(f"I/O operation on closed file: {data.pdf.stream.name}")
 
-        if data.pdf == self:
-            return data
+        def replace_in_obj(
+            obj: PdfObject, crossref: dict[IndirectObject, IndirectObject]
+        ) -> None:
+            if isinstance(obj, DictionaryObject):
+                key_val = obj.items()
+            elif isinstance(obj, ArrayObject):
+                key_val = enumerate(obj)  # type: ignore
+            else:
+                return
+            assert isinstance(obj, (DictionaryObject, ArrayObject))
+            for k, v in key_val:
+                if isinstance(v, IndirectObject):
+                    orphans[v.idnum - 1] = False
+                    if v in crossref:
+                        obj[k] = crossref[v]
+                else:
+                    """the filtering on DictionaryObject and ArrayObject only
+                    will be performed within replace_in_obj"""
+                    replace_in_obj(v, crossref)
 
-        # Get real object indirect object
-        real_obj = data.pdf.get_object(data)
+        # _idnum_hash :dict[hash]=(1st_ind_obj,[other_indir_objs,...])
+        self._idnum_hash = {}
+        orphans = [True] * len(self._objects)
+        # look for similar objects
+        for idx, obj in enumerate(self._objects):
+            if is_null_or_none(obj):
+                continue
+            assert obj is not None, "mypy"  # mypy: TypeGuard of `is_null_or_none` does not help here.
+            assert isinstance(obj.indirect_reference, IndirectObject)
+            h = obj.hash_value()
+            if remove_identicals and h in self._idnum_hash:
+                self._idnum_hash[h][1].append(obj.indirect_reference)
+                self._objects[idx] = None
+            else:
+                self._idnum_hash[h] = (obj.indirect_reference, [])
 
-        if real_obj is None:
-            logger_warning(
-                f"Unable to resolve [{data.__class__.__name__}: {data}], "
-                "returning NullObject instead",
-                __name__,
-            )
-            real_obj = NullObject()
+        # generate the dict converting others to 1st
+        cnv = {v[0]: v[1] for v in self._idnum_hash.values() if len(v[1]) > 0}
+        cnv_rev: dict[IndirectObject, IndirectObject] = {}
+        for k, v in cnv.items():
+            cnv_rev.update(zip(v, (k,) * len(v)))
 
-        hash_value = real_obj.hash_value()
+        # replace reference to merged objects
+        for obj in self._objects:
+            if isinstance(obj, (DictionaryObject, ArrayObject)):
+                replace_in_obj(obj, cnv_rev)
 
-        # Check if object is handled
-        if hash_value in self._idnum_hash:
-            return self._idnum_hash[hash_value]
+        # remove orphans (if applicable)
+        orphans[self.root_object.indirect_reference.idnum - 1] = False  # type: ignore
 
-        if data.pdf == self:
-            self._idnum_hash[hash_value] = IndirectObject(data.idnum, 0, self)
-        # This is new object in this pdf
-        else:
-            self._idnum_hash[hash_value] = self._add_object(real_obj)
+        if not is_null_or_none(self._info):
+            orphans[self._info.indirect_reference.idnum - 1] = False  # type: ignore
 
-        return self._idnum_hash[hash_value]
+        try:
+            orphans[self._ID.indirect_reference.idnum - 1] = False  # type: ignore
+        except AttributeError:
+            pass
+        for i in compress(range(len(self._objects)), orphans):
+            self._objects[i] = None
 
     def get_reference(self, obj: PdfObject) -> IndirectObject:
         idnum = self._objects.index(obj) + 1
@@ -1291,19 +1658,14 @@ class PdfWriter:
         assert ref.get_object() == obj
         return ref
 
-    def getReference(self, obj: PdfObject) -> IndirectObject:  # deprecated
-        """
-        .. deprecated:: 1.28.0
-
-            Use :meth:`get_reference` instead.
-        """
-        deprecation_with_replacement("getReference", "get_reference", "3.0.0")
-        return self.get_reference(obj)
-
     def get_outline_root(self) -> TreeObject:
         if CO.OUTLINES in self._root_object:
-            # TABLE 3.25 Entries in the catalog dictionary
+            # Entries in the catalog dictionary
             outline = cast(TreeObject, self._root_object[CO.OUTLINES])
+            if not isinstance(outline, TreeObject):
+                t = TreeObject(outline)
+                self._replace_object(outline.indirect_reference.idnum, t)
+                outline = t
             idnum = self._objects.index(outline) + 1
             outline_ref = IndirectObject(idnum, 0, self)
             assert outline_ref.get_object() == outline
@@ -1319,14 +1681,15 @@ class PdfWriter:
         """
         The list of threads.
 
-        See §8.3.2 from PDF 1.7 spec.
+        See §12.4.3 of the PDF 1.7 or PDF 2.0 specification.
 
         Returns:
-            An array (possibly empty) of Dictionaries with ``/F`` and
-            ``/I`` properties.
+            An array (possibly empty) of Dictionaries with an ``/F`` key,
+            and optionally information about the thread in ``/I`` or ``/Metadata`` keys.
+
         """
         if CO.THREADS in self._root_object:
-            # TABLE 3.25 Entries in the catalog dictionary
+            # Entries in the catalog dictionary
             threads = cast(ArrayObject, self._root_object[CO.THREADS])
         else:
             threads = ArrayObject()
@@ -1336,143 +1699,64 @@ class PdfWriter:
     @property
     def threads(self) -> ArrayObject:
         """
-        Read-only property for the list of threads see §8.3.2 from PDF 1.7 spec
+        Read-only property for the list of threads.
 
-        Each element is a dictionaries with ``/F`` and ``/I`` keys.
+        See §12.4.3 of the PDF 1.7 or PDF 2.0 specification.
+
+        Each element is a dictionary with an ``/F`` key, and optionally
+        information about the thread in ``/I`` or ``/Metadata`` keys.
         """
         return self.get_threads_root()
 
-    def getOutlineRoot(self) -> TreeObject:  # deprecated
-        """
-        .. deprecated:: 1.28.0
-
-            Use :meth:`get_outline_root` instead.
-        """
-        deprecation_with_replacement("getOutlineRoot", "get_outline_root", "3.0.0")
-        return self.get_outline_root()
-
-    def get_named_dest_root(self) -> ArrayObject:
-        if CA.NAMES in self._root_object and isinstance(
-            self._root_object[CA.NAMES], DictionaryObject
-        ):
-            names = cast(DictionaryObject, self._root_object[CA.NAMES])
-            names_ref = names.indirect_reference
-            if CA.DESTS in names and isinstance(names[CA.DESTS], DictionaryObject):
-                # 3.6.3 Name Dictionary (PDF spec 1.7)
-                dests = cast(DictionaryObject, names[CA.DESTS])
-                dests_ref = dests.indirect_reference
-                if CA.NAMES in dests:
-                    # TABLE 3.33 Entries in a name tree node dictionary
-                    nd = cast(ArrayObject, dests[CA.NAMES])
-                else:
-                    nd = ArrayObject()
-                    dests[NameObject(CA.NAMES)] = nd
-            else:
-                dests = DictionaryObject()
-                dests_ref = self._add_object(dests)
-                names[NameObject(CA.DESTS)] = dests_ref
-                nd = ArrayObject()
-                dests[NameObject(CA.NAMES)] = nd
-
-        else:
-            names = DictionaryObject()
-            names_ref = self._add_object(names)
-            self._root_object[NameObject(CA.NAMES)] = names_ref
-            dests = DictionaryObject()
-            dests_ref = self._add_object(dests)
-            names[NameObject(CA.DESTS)] = dests_ref
-            nd = ArrayObject()
-            dests[NameObject(CA.NAMES)] = nd
-
-        return nd
-
-    def getNamedDestRoot(self) -> ArrayObject:  # deprecated
-        """
-        .. deprecated:: 1.28.0
-
-            Use :meth:`get_named_dest_root` instead.
-        """
-        deprecation_with_replacement("getNamedDestRoot", "get_named_dest_root", "3.0.0")
-        return self.get_named_dest_root()
-
     def add_outline_item_destination(
         self,
-        page_destination: Union[None, PageObject, TreeObject] = None,
+        page_destination: Union[IndirectObject, PageObject, TreeObject],
         parent: Union[None, TreeObject, IndirectObject] = None,
         before: Union[None, TreeObject, IndirectObject] = None,
-        dest: Union[None, PageObject, TreeObject] = None,  # deprecated
+        is_open: bool = True,
     ) -> IndirectObject:
-        if page_destination is not None and dest is not None:  # deprecated
-            raise ValueError(
-                "The argument dest of add_outline_item_destination is "
-                "deprecated. Use page_destination only."
+        page_destination = cast(PageObject, page_destination.get_object())
+        if isinstance(page_destination, PageObject):
+            return self.add_outline_item_destination(
+                Destination(
+                    f"page #{page_destination.page_number}",
+                    cast(IndirectObject, page_destination.indirect_reference),
+                    Fit.fit(),
+                )
             )
-        if dest is not None:  # deprecated
-            old_term = "dest"
-            new_term = "page_destination"
-            warnings.warn(
-                message=(
-                    f"{old_term} is deprecated as an argument and will be "
-                    f"removed in pypdf 4.0.0. Use {new_term} instead"
-                ),
-                category=DeprecationWarning,
-            )
-            page_destination = dest
-        if page_destination is None:  # deprecated
-            # argument is only Optional due to deprecated argument.
-            raise ValueError("page_destination may not be None")
 
         if parent is None:
             parent = self.get_outline_root()
 
+        page_destination[NameObject("/%is_open%")] = BooleanObject(is_open)
         parent = cast(TreeObject, parent.get_object())
         page_destination_ref = self._add_object(page_destination)
         if before is not None:
             before = before.indirect_reference
-        parent.insert_child(page_destination_ref, before, self)
+        parent.insert_child(
+            page_destination_ref,
+            before,
+            self,
+            page_destination.inc_parent_counter_outline
+            if is_open
+            else (lambda x, y: 0),  # noqa: ARG005
+        )
+        if "/Count" not in page_destination:
+            page_destination[NameObject("/Count")] = NumberObject(0)
 
         return page_destination_ref
 
-    def add_bookmark_destination(
-        self,
-        dest: Union[PageObject, TreeObject],
-        parent: Union[None, TreeObject, IndirectObject] = None,
-    ) -> IndirectObject:  # deprecated
-        """
-        .. deprecated:: 2.9.0
-
-            Use :meth:`add_outline_item_destination` instead.
-        """
-        deprecation_with_replacement(
-            "add_bookmark_destination", "add_outline_item_destination", "3.0.0"
-        )
-        return self.add_outline_item_destination(dest, parent)
-
-    def addBookmarkDestination(
-        self, dest: PageObject, parent: Optional[TreeObject] = None
-    ) -> IndirectObject:  # deprecated
-        """
-        .. deprecated:: 1.28.0
-
-            Use :meth:`add_outline_item_destination` instead.
-        """
-        deprecation_with_replacement(
-            "addBookmarkDestination", "add_outline_item_destination", "3.0.0"
-        )
-        return self.add_outline_item_destination(dest, parent)
-
-    @deprecation_bookmark(bookmark="outline_item")
     def add_outline_item_dict(
         self,
         outline_item: OutlineItemType,
         parent: Union[None, TreeObject, IndirectObject] = None,
         before: Union[None, TreeObject, IndirectObject] = None,
+        is_open: bool = True,
     ) -> IndirectObject:
         outline_item_object = TreeObject()
-        for k, v in list(outline_item.items()):
-            outline_item_object[NameObject(str(k))] = v
         outline_item_object.update(outline_item)
 
+        """code currently unreachable
         if "/A" in outline_item:
             action = DictionaryObject()
             a_dict = cast(DictionaryObject, outline_item["/A"])
@@ -1480,36 +1764,10 @@ class PdfWriter:
                 action[NameObject(str(k))] = v
             action_ref = self._add_object(action)
             outline_item_object[NameObject("/A")] = action_ref
-
-        return self.add_outline_item_destination(outline_item_object, parent, before)
-
-    @deprecation_bookmark(bookmark="outline_item")
-    def add_bookmark_dict(
-        self, outline_item: OutlineItemType, parent: Optional[TreeObject] = None
-    ) -> IndirectObject:  # deprecated
         """
-        .. deprecated:: 2.9.0
-
-            Use :meth:`add_outline_item_dict` instead.
-        """
-        deprecation_with_replacement(
-            "add_bookmark_dict", "add_outline_item_dict", "3.0.0"
+        return self.add_outline_item_destination(
+            outline_item_object, parent, before, is_open
         )
-        return self.add_outline_item_dict(outline_item, parent)
-
-    @deprecation_bookmark(bookmark="outline_item")
-    def addBookmarkDict(
-        self, outline_item: OutlineItemType, parent: Optional[TreeObject] = None
-    ) -> IndirectObject:  # deprecated
-        """
-        .. deprecated:: 1.28.0
-
-            Use :meth:`add_outline_item_dict` instead.
-        """
-        deprecation_with_replacement(
-            "addBookmarkDict", "add_outline_item_dict", "3.0.0"
-        )
-        return self.add_outline_item_dict(outline_item, parent)
 
     def add_outline_item(
         self,
@@ -1517,42 +1775,37 @@ class PdfWriter:
         page_number: Union[None, PageObject, IndirectObject, int],
         parent: Union[None, TreeObject, IndirectObject] = None,
         before: Union[None, TreeObject, IndirectObject] = None,
-        color: Optional[Union[Tuple[float, float, float], str]] = None,
+        color: Optional[Union[tuple[float, float, float], str]] = None,
         bold: bool = False,
         italic: bool = False,
         fit: Fit = PAGE_FIT,
-        pagenum: Optional[int] = None,  # deprecated
+        is_open: bool = True,
     ) -> IndirectObject:
         """
         Add an outline item (commonly referred to as a "Bookmark") to the PDF file.
 
         Args:
-          title: Title to use for this outline item.
-          page_number: Page number this outline item will point to.
-          parent: A reference to a parent outline item to create nested
-            outline items.
-          parent: A reference to a parent outline item to create nested
-            outline items.
-          color: Color of the outline item's font as a red, green, blue tuple
-            from 0.0 to 1.0 or as a Hex String (#RRGGBB)
-          bold: Outline item font is bold
-          italic: Outline item font is italic
-          fit: The fit of the destination page.
+            title: Title to use for this outline item.
+            page_number: Page number this outline item will point to.
+            parent: A reference to a parent outline item to create nested
+                outline items.
+            before:
+            color: Color of the outline item's font as a red, green, blue tuple
+                from 0.0 to 1.0 or as a Hex String (#RRGGBB)
+            bold: Outline item font is bold
+            italic: Outline item font is italic
+            fit: The fit of the destination page.
 
         Returns:
-          The added outline item as an indirect object.
+            The added outline item as an indirect object.
+
         """
         page_ref: Union[None, NullObject, IndirectObject, NumberObject]
         if isinstance(italic, Fit):  # it means that we are on the old params
             if fit is not None and page_number is None:
-                page_number = fit  # type: ignore
+                page_number = fit
             return self.add_outline_item(
-                title, page_number, parent, None, before, color, bold, italic  # type: ignore
-            )
-        if page_number is not None and pagenum is not None:
-            raise ValueError(
-                "The argument pagenum of add_outline_item is deprecated. "
-                "Use page_number only."
+                title, page_number, parent, None, before, color, bold, italic, is_open=is_open
             )
         if page_number is None:
             action_ref = None
@@ -1586,66 +1839,13 @@ class PdfWriter:
                     }
                 )
             )
-        outline_item = _create_outline_item(action_ref, title, color, italic, bold)
+        outline_item = self._add_object(
+            _create_outline_item(action_ref, title, color, italic, bold)
+        )
 
         if parent is None:
             parent = self.get_outline_root()
-        return self.add_outline_item_destination(outline_item, parent, before)
-
-    def add_bookmark(
-        self,
-        title: str,
-        pagenum: int,  # deprecated, but the whole method is deprecated
-        parent: Union[None, TreeObject, IndirectObject] = None,
-        color: Optional[Tuple[float, float, float]] = None,
-        bold: bool = False,
-        italic: bool = False,
-        fit: FitType = "/Fit",
-        *args: ZoomArgType,
-    ) -> IndirectObject:  # deprecated
-        """
-        .. deprecated:: 2.9.0
-
-            Use :meth:`add_outline_item` instead.
-        """
-        deprecation_with_replacement("add_bookmark", "add_outline_item", "3.0.0")
-        return self.add_outline_item(
-            title,
-            pagenum,
-            parent,
-            color,  # type: ignore
-            bold,  # type: ignore
-            italic,
-            Fit(fit_type=fit, fit_args=args),  # type: ignore
-        )
-
-    def addBookmark(
-        self,
-        title: str,
-        pagenum: int,
-        parent: Union[None, TreeObject, IndirectObject] = None,
-        color: Optional[Tuple[float, float, float]] = None,
-        bold: bool = False,
-        italic: bool = False,
-        fit: FitType = "/Fit",
-        *args: ZoomArgType,
-    ) -> IndirectObject:  # deprecated
-        """
-        .. deprecated:: 1.28.0
-
-            Use :meth:`add_outline_item` instead.
-        """
-        deprecation_with_replacement("addBookmark", "add_outline_item", "3.0.0")
-        return self.add_outline_item(
-            title,
-            pagenum,
-            parent,
-            None,
-            color,
-            bold,
-            italic,
-            Fit(fit_type=fit, fit_args=args),
-        )
+        return self.add_outline_item_destination(outline_item, parent, before, is_open)
 
     def add_outline(self) -> None:
         raise NotImplementedError(
@@ -1655,42 +1855,21 @@ class PdfWriter:
     def add_named_destination_array(
         self, title: TextStringObject, destination: Union[IndirectObject, ArrayObject]
     ) -> None:
-        nd = self.get_named_dest_root()
+        named_dest = self.get_named_dest_root()
         i = 0
-        while i < len(nd):
-            if title < nd[i]:
-                nd.insert(i, destination)
-                nd.insert(i, TextStringObject(title))
+        while i < len(named_dest):
+            if title < named_dest[i]:
+                named_dest.insert(i, destination)
+                named_dest.insert(i, TextStringObject(title))
                 return
-            else:
-                i += 2
-        nd.extend([TextStringObject(title), destination])
+            i += 2
+        named_dest.extend([TextStringObject(title), destination])
         return
 
     def add_named_destination_object(
         self,
-        page_destination: Optional[PdfObject] = None,
-        dest: Optional[PdfObject] = None,
+        page_destination: PdfObject,
     ) -> IndirectObject:
-        if page_destination is not None and dest is not None:
-            raise ValueError(
-                "The argument dest of add_named_destination_object is "
-                "deprecated. Use page_destination only."
-            )
-        if dest is not None:  # deprecated
-            old_term = "dest"
-            new_term = "page_destination"
-            warnings.warn(
-                message=(
-                    f"{old_term} is deprecated as an argument and will be "
-                    f"removed in pypdf 4.0.0. Use {new_term} instead"
-                ),
-                category=DeprecationWarning,
-            )
-            page_destination = dest
-        if page_destination is None:  # deprecated
-            raise ValueError("page_destination may not be None")
-
         page_destination_ref = self._add_object(page_destination.dest_array)  # type: ignore
         self.add_named_destination_array(
             cast("TextStringObject", page_destination["/Title"]), page_destination_ref  # type: ignore
@@ -1698,44 +1877,12 @@ class PdfWriter:
 
         return page_destination_ref
 
-    def addNamedDestinationObject(
-        self, dest: Destination
-    ) -> IndirectObject:  # deprecated
-        """
-        .. deprecated:: 1.28.0
-
-            Use :meth:`add_named_destination_object` instead.
-        """
-        deprecation_with_replacement(
-            "addNamedDestinationObject", "add_named_destination_object", "3.0.0"
-        )
-        return self.add_named_destination_object(dest)
-
     def add_named_destination(
         self,
         title: str,
-        page_number: Optional[int] = None,
-        pagenum: Optional[int] = None,  # deprecated
+        page_number: int,
     ) -> IndirectObject:
-        if page_number is not None and pagenum is not None:
-            raise ValueError(
-                "The argument pagenum of add_outline_item is deprecated. "
-                "Use page_number only."
-            )
-        if pagenum is not None:
-            old_term = "pagenum"
-            new_term = "page_number"
-            warnings.warn(
-                message=(
-                    f"{old_term} is deprecated as an argument and will be "
-                    f"removed in pypdf 4.0.0. Use {new_term} instead"
-                ),
-                category=DeprecationWarning,
-            )
-            page_number = pagenum
-        if page_number is None:
-            raise ValueError("page_number may not be None")
-        page_ref = self.get_object(self._pages)[PA.KIDS][page_number]  # type: ignore
+        page_ref = self.get_object(self._pages)[PagesAttributes.KIDS][page_number]  # type: ignore
         dest = DictionaryObject()
         dest.update(
             {
@@ -1747,182 +1894,322 @@ class PdfWriter:
         )
 
         dest_ref = self._add_object(dest)
-        nd = self.get_named_dest_root()
         if not isinstance(title, TextStringObject):
             title = TextStringObject(str(title))
-        nd.extend([title, dest_ref])
+
+        self.add_named_destination_array(title, dest_ref)
         return dest_ref
-
-    def addNamedDestination(
-        self, title: str, pagenum: int
-    ) -> IndirectObject:  # deprecated
-        """
-        .. deprecated:: 1.28.0
-
-            Use :meth:`add_named_destination` instead.
-        """
-        deprecation_with_replacement(
-            "addNamedDestination", "add_named_destination", "3.0.0"
-        )
-        return self.add_named_destination(title, pagenum)
 
     def remove_links(self) -> None:
         """Remove links and annotations from this output."""
-        pg_dict = cast(DictionaryObject, self.get_object(self._pages))
-        pages = cast(ArrayObject, pg_dict[PA.KIDS])
-        for page in pages:
-            page_ref = cast(DictionaryObject, self.get_object(page))
-            if PG.ANNOTS in page_ref:
-                del page_ref[PG.ANNOTS]
+        for page in self.pages:
+            self.remove_objects_from_page(page, ObjectDeletionFlag.ALL_ANNOTATIONS)
 
-    def removeLinks(self) -> None:  # deprecated
+    def remove_annotations(
+        self, subtypes: Optional[Union[AnnotationSubtype, Iterable[AnnotationSubtype]]]
+    ) -> None:
         """
-        .. deprecated:: 1.28.0
+        Remove annotations by annotation subtype.
 
-            Use :meth:`remove_links` instead.
+        Args:
+            subtypes: subtype or list of subtypes to be removed.
+                Examples are: "/Link", "/FileAttachment", "/Sound",
+                "/Movie", "/Screen", ...
+                If you want to remove all annotations, use subtypes=None.
+
         """
-        deprecation_with_replacement("removeLinks", "remove_links", "3.0.0")
-        return self.remove_links()
+        for page in self.pages:
+            self._remove_annots_from_page(page, subtypes)
 
-    def remove_images(self, ignore_byte_string_object: bool = False) -> None:
+    def _remove_annots_from_page(
+        self,
+        page: Union[IndirectObject, PageObject, DictionaryObject],
+        subtypes: Optional[Iterable[str]],
+    ) -> None:
+        page = cast(DictionaryObject, page.get_object())
+        if PG.ANNOTS in page:
+            i = 0
+            while i < len(cast(ArrayObject, page[PG.ANNOTS])):
+                an = cast(ArrayObject, page[PG.ANNOTS])[i]
+                obj = cast(DictionaryObject, an.get_object())
+                if subtypes is None or cast(str, obj["/Subtype"]) in subtypes:
+                    if isinstance(an, IndirectObject):
+                        self._objects[an.idnum - 1] = NullObject()  # to reduce PDF size
+                    del page[PG.ANNOTS][i]  # type:ignore
+                else:
+                    i += 1
+
+    def remove_objects_from_page(
+        self,
+        page: Union[PageObject, DictionaryObject],
+        to_delete: Union[ObjectDeletionFlag, Iterable[ObjectDeletionFlag]],
+        text_filters: Optional[dict[str, Any]] = None
+    ) -> None:
+        """
+        Remove objects specified by ``to_delete`` from the given page.
+
+        Args:
+            page: Page object to clean up.
+            to_delete: Objects to be deleted; can be a ``ObjectDeletionFlag``
+                or a list of ObjectDeletionFlag
+            text_filters: Properties of text to be deleted, if applicable. Optional.
+                This is a Python dictionary with the following properties:
+
+                * font_ids: List of font resource IDs (such as /F1 or /T1_0) to be deleted.
+
+        """
+        if isinstance(to_delete, (list, tuple)):
+            for to_d in to_delete:
+                self.remove_objects_from_page(page, to_d)
+            return None
+        assert isinstance(to_delete, ObjectDeletionFlag)
+
+        if to_delete & ObjectDeletionFlag.LINKS:
+            return self._remove_annots_from_page(page, ("/Link",))
+        if to_delete & ObjectDeletionFlag.ATTACHMENTS:
+            return self._remove_annots_from_page(
+                page, ("/FileAttachment", "/Sound", "/Movie", "/Screen")
+            )
+        if to_delete & ObjectDeletionFlag.OBJECTS_3D:
+            return self._remove_annots_from_page(page, ("/3D",))
+        if to_delete & ObjectDeletionFlag.ALL_ANNOTATIONS:
+            return self._remove_annots_from_page(page, None)
+
+        jump_operators = []
+        if to_delete & ObjectDeletionFlag.DRAWING_IMAGES:
+            jump_operators = [
+                b"w", b"J", b"j", b"M", b"d", b"i",
+                b"W", b"W*",
+                b"b", b"b*", b"B", b"B*", b"S", b"s", b"f", b"f*", b"F", b"n",
+                b"m", b"l", b"c", b"v", b"y", b"h", b"re",
+                b"sh"
+            ]
+        if to_delete & ObjectDeletionFlag.TEXT:
+            jump_operators = [b"Tj", b"TJ", b"'", b'"']
+
+        if not isinstance(page, PageObject):
+            page = PageObject(self, page.indirect_reference)  # pragma: no cover
+        if "/Contents" in page:
+            content = cast(ContentStream, page.get_contents())
+
+            images, forms = self._remove_objects_from_page__clean_forms(
+                elt=page, stack=[], jump_operators=jump_operators, to_delete=to_delete, text_filters=text_filters,
+            )
+
+            self._remove_objects_from_page__clean(
+                content=content, images=images, forms=forms,
+                jump_operators=jump_operators, to_delete=to_delete,
+                text_filters=text_filters
+            )
+            page.replace_contents(content)
+        return [], []  # type: ignore[return-value]
+
+    def _remove_objects_from_page__clean(
+            self,
+            content: ContentStream,
+            images: list[str],
+            forms: list[str],
+            jump_operators: list[bytes],
+            to_delete: ObjectDeletionFlag,
+            text_filters: Optional[dict[str, Any]] = None,
+    ) -> None:
+        font_id = None
+        font_ids_to_delete = []
+        if text_filters and to_delete & ObjectDeletionFlag.TEXT:
+            font_ids_to_delete = text_filters.get("font_ids", [])
+
+        i = 0
+        while i < len(content.operations):
+            operands, operator = content.operations[i]
+            if operator == b"Tf":
+                font_id = operands[0]
+            if (
+                (
+                    operator == b"INLINE IMAGE"
+                    and (to_delete & ObjectDeletionFlag.INLINE_IMAGES)
+                )
+                or (operator in jump_operators)
+                or (
+                    operator == b"Do"
+                    and (to_delete & ObjectDeletionFlag.XOBJECT_IMAGES)
+                    and (operands[0] in images)
+                )
+            ):
+                if (
+                    not to_delete & ObjectDeletionFlag.TEXT
+                    or (to_delete & ObjectDeletionFlag.TEXT and not text_filters)
+                    or (to_delete & ObjectDeletionFlag.TEXT and font_id in font_ids_to_delete)
+                ):
+                    del content.operations[i]
+                else:
+                    i += 1
+            else:
+                i += 1
+        content.get_data()  # this ensures ._data is rebuilt from the .operations
+
+    def _remove_objects_from_page__clean_forms(
+            self,
+            elt: DictionaryObject,
+            stack: list[DictionaryObject],
+            jump_operators: list[bytes],
+            to_delete: ObjectDeletionFlag,
+            text_filters: Optional[dict[str, Any]] = None,
+    ) -> tuple[list[str], list[str]]:
+        # elt in recursive call is a new ContentStream object, so we have to check the indirect_reference
+        if (elt in stack) or (
+                hasattr(elt, "indirect_reference") and any(
+                    elt.indirect_reference == getattr(x, "indirect_reference", -1)
+                    for x in stack
+                )
+        ):
+            # to prevent infinite looping
+            return [], []  # pragma: no cover
+        try:
+            d = cast(
+                dict[Any, Any],
+                cast(DictionaryObject, elt["/Resources"])["/XObject"],
+            )
+        except KeyError:
+            d = {}
+        images = []
+        forms = []
+        for k, v in d.items():
+            o = v.get_object()
+            try:
+                content: Any = None
+                if (
+                        to_delete & ObjectDeletionFlag.XOBJECT_IMAGES
+                        and o["/Subtype"] == "/Image"
+                ):
+                    content = NullObject()  # to delete the image keeping the entry
+                    images.append(k)
+                if o["/Subtype"] == "/Form":
+                    forms.append(k)
+                    if isinstance(o, ContentStream):
+                        content = o
+                    else:
+                        content = ContentStream(o, self)
+                        content.update(
+                            {
+                                k1: v1
+                                for k1, v1 in o.items()
+                                if k1 not in ["/Length", "/Filter", "/DecodeParms"]
+                            }
+                        )
+                        try:
+                            content.indirect_reference = o.indirect_reference
+                        except AttributeError:  # pragma: no cover
+                            pass
+                    stack.append(elt)
+
+                    # clean subforms
+                    self._remove_objects_from_page__clean_forms(
+                        elt=content, stack=stack, jump_operators=jump_operators, to_delete=to_delete,
+                        text_filters=text_filters,
+                    )
+                if content is not None:
+                    if isinstance(v, IndirectObject):
+                        self._objects[v.idnum - 1] = content
+                    else:
+                        # should only occur in a PDF not respecting PDF spec
+                        # where streams must be indirected.
+                        d[k] = self._add_object(content)  # pragma: no cover
+            except (TypeError, KeyError):
+                pass
+        for im in images:
+            del d[im]  # for clean-up
+        if isinstance(elt, StreamObject):  # for /Form
+            if not isinstance(elt, ContentStream):  # pragma: no cover
+                e = ContentStream(elt, self)
+                e.update(elt.items())
+                elt = e
+            # clean the content
+            self._remove_objects_from_page__clean(
+                content=elt, images=images, forms=forms, jump_operators=jump_operators,
+                to_delete=to_delete, text_filters=text_filters
+            )
+        return images, forms
+
+    def remove_images(
+        self,
+        to_delete: ImageType = ImageType.ALL,
+    ) -> None:
         """
         Remove images from this output.
 
         Args:
-          ignore_byte_string_object: optional parameter
-            to ignore ByteString Objects.
+            to_delete: The type of images to be deleted
+                (default = all images types)
+
         """
-        pg_dict = cast(DictionaryObject, self.get_object(self._pages))
-        pages = cast(ArrayObject, pg_dict[PA.KIDS])
-        jump_operators = (
-            b"cm",
-            b"w",
-            b"J",
-            b"j",
-            b"M",
-            b"d",
-            b"ri",
-            b"i",
-            b"gs",
-            b"W",
-            b"b",
-            b"s",
-            b"S",
-            b"f",
-            b"F",
-            b"n",
-            b"m",
-            b"l",
-            b"c",
-            b"v",
-            b"y",
-            b"h",
-            b"B",
-            b"Do",
-            b"sh",
-        )
-        for page in pages:
-            page_ref = cast(DictionaryObject, self.get_object(page))
-            content = page_ref["/Contents"].get_object()
-            if not isinstance(content, ContentStream):
-                content = ContentStream(content, page_ref)
+        if isinstance(to_delete, bool):
+            to_delete = ImageType.ALL
 
-            _operations = []
-            seq_graphics = False
-            for operands, operator in content.operations:
-                if operator in [b"Tj", b"'"]:
-                    text = operands[0]
-                    if ignore_byte_string_object and not isinstance(
-                        text, TextStringObject
-                    ):
-                        operands[0] = TextStringObject()
-                elif operator == b'"':
-                    text = operands[2]
-                    if ignore_byte_string_object and not isinstance(
-                        text, TextStringObject
-                    ):
-                        operands[2] = TextStringObject()
-                elif operator == b"TJ":
-                    for i in range(len(operands[0])):
-                        if ignore_byte_string_object and not isinstance(
-                            operands[0][i], TextStringObject
-                        ):
-                            operands[0][i] = TextStringObject()
+        i = ObjectDeletionFlag.NONE
 
-                if operator == b"q":
-                    seq_graphics = True
-                if operator == b"Q":
-                    seq_graphics = False
-                if seq_graphics and operator in jump_operators:
-                    continue
-                if operator == b"re":
-                    continue
-                _operations.append((operands, operator))
+        for image in ("XOBJECT_IMAGES", "INLINE_IMAGES", "DRAWING_IMAGES"):
+            if to_delete & ImageType[image]:
+                i |= ObjectDeletionFlag[image]
 
-            content.operations = _operations
-            page_ref.__setitem__(NameObject("/Contents"), content)
+        for page in self.pages:
+            self.remove_objects_from_page(page, i)
 
-    def removeImages(self, ignoreByteStringObject: bool = False) -> None:  # deprecated
+    def remove_text(self, font_names: Optional[list[str]] = None) -> None:
         """
-        .. deprecated:: 1.28.0
-
-            Use :meth:`remove_images` instead.
-        """
-        deprecation_with_replacement("removeImages", "remove_images", "3.0.0")
-        return self.remove_images(ignoreByteStringObject)
-
-    def remove_text(self, ignore_byte_string_object: bool = False) -> None:
-        """
-        Remove text from this output.
+        Remove text from the PDF.
 
         Args:
-          ignore_byte_string_object: optional parameter
+            font_names: List of font names to remove, such as "Helvetica-Bold".
+                Optional. If not specified, all text will be removed.
         """
-        pg_dict = cast(DictionaryObject, self.get_object(self._pages))
-        pages = cast(List[IndirectObject], pg_dict[PA.KIDS])
-        for page in pages:
-            page_ref = cast(PageObject, self.get_object(page))
-            content = page_ref["/Contents"].get_object()
-            if not isinstance(content, ContentStream):
-                content = ContentStream(content, page_ref)
-            for operands, operator in content.operations:
-                if operator in [b"Tj", b"'"]:
-                    text = operands[0]
-                    if not ignore_byte_string_object:
-                        if isinstance(text, TextStringObject):
-                            operands[0] = TextStringObject()
-                    else:
-                        if isinstance(text, (TextStringObject, ByteStringObject)):
-                            operands[0] = TextStringObject()
-                elif operator == b'"':
-                    text = operands[2]
-                    if not ignore_byte_string_object:
-                        if isinstance(text, TextStringObject):
-                            operands[2] = TextStringObject()
-                    else:
-                        if isinstance(text, (TextStringObject, ByteStringObject)):
-                            operands[2] = TextStringObject()
-                elif operator == b"TJ":
-                    for i in range(len(operands[0])):
-                        if not ignore_byte_string_object:
-                            if isinstance(operands[0][i], TextStringObject):
-                                operands[0][i] = TextStringObject()
-                        else:
-                            if isinstance(
-                                operands[0][i], (TextStringObject, ByteStringObject)
-                            ):
-                                operands[0][i] = TextStringObject()
+        if not font_names:
+            font_names = []
 
-            page_ref.__setitem__(NameObject("/Contents"), content)
+        for page in self.pages:
+            resource_ids_to_remove = []
 
-    def removeText(self, ignoreByteStringObject: bool = False) -> None:  # deprecated
-        """
-        .. deprecated:: 1.28.0
+            # Content streams reference fonts and other resources with names like "/F1" or "/T1_0"
+            # Font names need to be converted to resource names/IDs for easier removal
+            if font_names:
+                # Recursively loop through page objects to gather font info
+                def get_font_info(
+                    obj: Any,
+                    font_info: Optional[dict[str, Any]] = None,
+                    key: Optional[str] = None
+                ) -> dict[str, Any]:
+                    if font_info is None:
+                        font_info = {}
+                    if isinstance(obj, IndirectObject):
+                        obj = obj.get_object()
+                    if isinstance(obj, dict):
+                        if obj.get("/Type") == "/Font":
+                            font_name = obj.get("/BaseFont", "")
+                            # Normalize font names like "/RRXFFV+Palatino-Bold" to "Palatino-Bold"
+                            normalized_font_name = font_name.lstrip("/").split("+")[-1]
+                            if normalized_font_name not in font_info:
+                                font_info[normalized_font_name] = {
+                                    "normalized_font_name": normalized_font_name,
+                                    "resource_ids": [],
+                                }
+                            if key not in font_info[normalized_font_name]["resource_ids"]:
+                                font_info[normalized_font_name]["resource_ids"].append(key)
+                        for k in obj:
+                            font_info = get_font_info(obj[k], font_info, k)
+                    elif isinstance(obj, (list, ArrayObject)):
+                        for child_obj in obj:
+                            font_info = get_font_info(child_obj, font_info)
+                    return font_info
 
-            Use :meth:`remove_text` instead.
-        """
-        deprecation_with_replacement("removeText", "remove_text", "3.0.0")
-        return self.remove_text(ignoreByteStringObject)
+                # Add relevant resource names for removal
+                font_info = get_font_info(page.get("/Resources"))
+                for font_name in font_names:
+                    if font_name in font_info:
+                        resource_ids_to_remove.extend(font_info[font_name]["resource_ids"])
+
+            text_filters = {}
+            if font_names:
+                text_filters["font_ids"] = resource_ids_to_remove
+            self.remove_objects_from_page(page, ObjectDeletionFlag.TEXT, text_filters=text_filters)
 
     def add_uri(
         self,
@@ -1930,43 +2217,36 @@ class PdfWriter:
         uri: str,
         rect: RectangleObject,
         border: Optional[ArrayObject] = None,
-        pagenum: Optional[int] = None,
     ) -> None:
         """
         Add an URI from a rectangular area to the specified page.
-        This uses the basic structure of :meth:`add_link`
 
         Args:
-          page_number: index of the page on which to place the URI action.
-          uri: URI of resource to link to.
-          rect: :class:`RectangleObject<pypdf.generic.RectangleObject>` or
-            array of four integers specifying the clickable rectangular area
-            ``[xLL, yLL, xUR, yUR]``, or string in the form ``"[ xLL yLL xUR yUR ]"``.
-          border: if provided, an array describing border-drawing
-            properties. See the PDF spec for details. No border will be
-            drawn if this argument is omitted.
+            page_number: index of the page on which to place the URI action.
+            uri: URI of resource to link to.
+            rect: :class:`RectangleObject<pypdf.generic.RectangleObject>` or
+                array of four integers specifying the clickable rectangular area
+                ``[xLL, yLL, xUR, yUR]``, or string in the form
+                ``"[ xLL yLL xUR yUR ]"``.
+            border: if provided, an array describing border-drawing
+                properties. See the PDF spec for details. No border will be
+                drawn if this argument is omitted.
+
         """
-        if pagenum is not None:
-            warnings.warn(
-                "The 'pagenum' argument of add_uri is deprecated and will be "
-                "removed in pypdf 4.0.0. Use 'page_number' instead.",
-                category=DeprecationWarning,
-            )
-            page_number = pagenum
-        page_link = self.get_object(self._pages)[PA.KIDS][page_number]  # type: ignore
-        page_ref = cast(Dict[str, Any], self.get_object(page_link))
+        page_link = self.get_object(self._pages)[PagesAttributes.KIDS][page_number]  # type: ignore
+        page_ref = cast(dict[str, Any], self.get_object(page_link))
 
         border_arr: BorderArrayType
         if border is not None:
-            border_arr = [NameObject(n) for n in border[:3]]
+            border_arr = [NumberObject(n) for n in border[:3]]
             if len(border) == 4:
-                dash_pattern = ArrayObject([NameObject(n) for n in border[3]])
+                dash_pattern = ArrayObject([NumberObject(n) for n in border[3]])
                 border_arr.append(dash_pattern)
         else:
             border_arr = [NumberObject(2), NumberObject(2), NumberObject(2)]
 
         if isinstance(rect, str):
-            rect = NameObject(rect)
+            rect = NumberObject(rect)
         elif isinstance(rect, RectangleObject):
             pass
         else:
@@ -1982,14 +2262,12 @@ class PdfWriter:
         lnk = DictionaryObject()
         lnk.update(
             {
-                NameObject(AnnotationDictionaryAttributes.Type): NameObject(PG.ANNOTS),
-                NameObject(AnnotationDictionaryAttributes.Subtype): NameObject("/Link"),
-                NameObject(AnnotationDictionaryAttributes.P): page_link,
-                NameObject(AnnotationDictionaryAttributes.Rect): rect,
+                NameObject(AA.Type): NameObject("/Annot"),
+                NameObject(AA.Subtype): NameObject("/Link"),
+                NameObject(AA.P): page_link,
+                NameObject(AA.Rect): rect,
                 NameObject("/H"): NameObject("/I"),
-                NameObject(AnnotationDictionaryAttributes.Border): ArrayObject(
-                    border_arr
-                ),
+                NameObject(AA.Border): ArrayObject(border_arr),
                 NameObject("/A"): lnk2,
             }
         )
@@ -1999,71 +2277,6 @@ class PdfWriter:
             page_ref[PG.ANNOTS].append(lnk_ref)
         else:
             page_ref[NameObject(PG.ANNOTS)] = ArrayObject([lnk_ref])
-
-    def addURI(
-        self,
-        pagenum: int,  # deprecated, but method is deprecated already
-        uri: str,
-        rect: RectangleObject,
-        border: Optional[ArrayObject] = None,
-    ) -> None:  # deprecated
-        """
-        .. deprecated:: 1.28.0
-
-            Use :meth:`add_uri` instead.
-        """
-        deprecation_with_replacement("addURI", "add_uri", "3.0.0")
-        return self.add_uri(pagenum, uri, rect, border)
-
-    def add_link(
-        self,
-        pagenum: int,  # deprecated, but method is deprecated already
-        page_destination: int,
-        rect: RectangleObject,
-        border: Optional[ArrayObject] = None,
-        fit: FitType = "/Fit",
-        *args: ZoomArgType,
-    ) -> None:
-        deprecation_with_replacement(
-            "add_link", "add_annotation(AnnotationBuilder.link(...))"
-        )
-
-        if isinstance(rect, str):
-            rect = rect.strip()[1:-1]
-            rect = RectangleObject(
-                [float(num) for num in rect.split(" ") if len(num) > 0]
-            )
-        elif isinstance(rect, RectangleObject):
-            pass
-        else:
-            rect = RectangleObject(rect)
-
-        annotation = AnnotationBuilder.link(
-            rect=rect,
-            border=border,
-            target_page_index=page_destination,
-            fit=Fit(fit_type=fit, fit_args=args),
-        )
-        return self.add_annotation(page_number=pagenum, annotation=annotation)
-
-    def addLink(
-        self,
-        pagenum: int,  # deprecated, but method is deprecated already
-        page_destination: int,
-        rect: RectangleObject,
-        border: Optional[ArrayObject] = None,
-        fit: FitType = "/Fit",
-        *args: ZoomArgType,
-    ) -> None:  # deprecated
-        """
-        .. deprecated:: 1.28.0
-
-            Use :meth:`add_link` instead.
-        """
-        deprecate_with_replacement(
-            "addLink", "add_annotation(AnnotationBuilder.link(...))", "4.0.0"
-        )
-        return self.add_link(pagenum, page_destination, rect, border, fit, *args)
 
     _valid_layouts = (
         "/NoLayout",
@@ -2081,21 +2294,12 @@ class PdfWriter:
         except KeyError:
             return None
 
-    def getPageLayout(self) -> Optional[LayoutType]:  # deprecated
-        """
-        .. deprecated:: 1.28.0
-
-            Use :py:attr:`page_layout` instead.
-        """
-        deprecation_with_replacement("getPageLayout", "page_layout", "3.0.0")
-        return self._get_page_layout()
-
     def _set_page_layout(self, layout: Union[NameObject, LayoutType]) -> None:
         """
         Set the page layout.
 
         Args:
-          str: layout: The page layout to be used.
+            layout: The page layout to be used.
 
         .. list-table:: Valid ``layout`` arguments
            :widths: 50 200
@@ -2114,6 +2318,7 @@ class PdfWriter:
              - Show two pages at a time, odd-numbered pages on the left
            * - /TwoPageRight
              - Show two pages at a time, odd-numbered pages on the right
+
         """
         if not isinstance(layout, NameObject):
             if layout not in self._valid_layouts:
@@ -2129,7 +2334,7 @@ class PdfWriter:
         Set the page layout.
 
         Args:
-          layout: The page layout to be used
+            layout: The page layout to be used
 
         .. list-table:: Valid ``layout`` arguments
            :widths: 50 200
@@ -2148,19 +2353,9 @@ class PdfWriter:
              - Show two pages at a time, odd-numbered pages on the left
            * - /TwoPageRight
              - Show two pages at a time, odd-numbered pages on the right
+
         """
         self._set_page_layout(layout)
-
-    def setPageLayout(self, layout: LayoutType) -> None:  # deprecated
-        """
-        .. deprecated:: 1.28.0
-
-            Use :py:attr:`page_layout` instead.
-        """
-        deprecation_with_replacement(
-            "writer.setPageLayout(val)", "writer.page_layout = val", "3.0.0"
-        )
-        return self._set_page_layout(layout)
 
     @property
     def page_layout(self) -> Optional[LayoutType]:
@@ -2191,26 +2386,6 @@ class PdfWriter:
     def page_layout(self, layout: LayoutType) -> None:
         self._set_page_layout(layout)
 
-    @property
-    def pageLayout(self) -> Optional[LayoutType]:  # deprecated
-        """
-        .. deprecated:: 1.28.0
-
-            Use :py:attr:`page_layout` instead.
-        """
-        deprecation_with_replacement("pageLayout", "page_layout", "3.0.0")
-        return self.page_layout
-
-    @pageLayout.setter
-    def pageLayout(self, layout: LayoutType) -> None:  # deprecated
-        """
-        .. deprecated:: 1.28.0
-
-            Use :py:attr:`page_layout` instead.
-        """
-        deprecation_with_replacement("pageLayout", "page_layout", "3.0.0")
-        self.page_layout = layout
-
     _valid_modes = (
         "/UseNone",
         "/UseOutlines",
@@ -2225,42 +2400,6 @@ class PdfWriter:
             return cast(PagemodeType, self._root_object["/PageMode"])
         except KeyError:
             return None
-
-    def getPageMode(self) -> Optional[PagemodeType]:  # deprecated
-        """
-        .. deprecated:: 1.28.0
-
-            Use :py:attr:`page_mode` instead.
-        """
-        deprecation_with_replacement("getPageMode", "page_mode", "3.0.0")
-        return self._get_page_mode()
-
-    def set_page_mode(self, mode: PagemodeType) -> None:
-        """
-        .. deprecated:: 1.28.0
-
-            Use :py:attr:`page_mode` instead.
-        """
-        if isinstance(mode, NameObject):
-            mode_name: NameObject = mode
-        else:
-            if mode not in self._valid_modes:
-                logger_warning(
-                    f"Mode should be one of: {', '.join(self._valid_modes)}", __name__
-                )
-            mode_name = NameObject(mode)
-        self._root_object.update({NameObject("/PageMode"): mode_name})
-
-    def setPageMode(self, mode: PagemodeType) -> None:  # deprecated
-        """
-        .. deprecated:: 1.28.0
-
-            Use :py:attr:`page_mode` instead.
-        """
-        deprecation_with_replacement(
-            "writer.setPageMode(val)", "writer.page_mode = val", "3.0.0"
-        )
-        self.set_page_mode(mode)
 
     @property
     def page_mode(self) -> Optional[PagemodeType]:
@@ -2287,40 +2426,52 @@ class PdfWriter:
 
     @page_mode.setter
     def page_mode(self, mode: PagemodeType) -> None:
-        self.set_page_mode(mode)
+        if isinstance(mode, NameObject):
+            mode_name: NameObject = mode
+        else:
+            if mode not in self._valid_modes:
+                logger_warning(
+                    f"Mode should be one of: {', '.join(self._valid_modes)}", __name__
+                )
+            mode_name = NameObject(mode)
+        self._root_object.update({NameObject("/PageMode"): mode_name})
 
-    @property
-    def pageMode(self) -> Optional[PagemodeType]:  # deprecated
+    def add_annotation(
+        self,
+        page_number: Union[int, PageObject],
+        annotation: dict[str, Any],
+    ) -> DictionaryObject:
         """
-        .. deprecated:: 1.28.0
+        Add a single annotation to the page.
+        The added annotation must be a new annotation.
+        It cannot be recycled.
 
-            Use :py:attr:`page_mode` instead.
+        Args:
+            page_number: PageObject or page index.
+            annotation: Annotation to be added (created with annotation).
+
+        Returns:
+            The inserted object.
+            This can be used for popup creation, for example.
+
         """
-        deprecation_with_replacement("pageMode", "page_mode", "3.0.0")
-        return self.page_mode
+        page = page_number
+        if isinstance(page, int):
+            page = self.pages[page]
+        elif not isinstance(page, PageObject):
+            raise TypeError("page: invalid type")
 
-    @pageMode.setter
-    def pageMode(self, mode: PagemodeType) -> None:  # deprecated
-        """
-        .. deprecated:: 1.28.0
-
-            Use :py:attr:`page_mode` instead.
-        """
-        deprecation_with_replacement("pageMode", "page_mode", "3.0.0")
-        self.page_mode = mode
-
-    def add_annotation(self, page_number: int, annotation: Dict[str, Any]) -> None:
         to_add = cast(DictionaryObject, _pdf_objectify(annotation))
-        to_add[NameObject("/P")] = self.get_object(self._pages)["/Kids"][page_number]  # type: ignore
-        page = self.pages[page_number]
+        to_add[NameObject("/P")] = page.indirect_reference
+
         if page.annotations is None:
             page[NameObject("/Annots")] = ArrayObject()
         assert page.annotations is not None
 
         # Internal link annotations need the correct object type for the
         # destination
-        if to_add.get("/Subtype") == "/Link" and NameObject("/Dest") in to_add:
-            tmp = cast(dict, to_add[NameObject("/Dest")])
+        if to_add.get("/Subtype") == "/Link" and "/Dest" in to_add:
+            tmp = cast(dict[Any, Any], to_add[NameObject("/Dest")])
             dest = Destination(
                 NameObject("/LinkName"),
                 tmp["target_page_index"],
@@ -2330,21 +2481,27 @@ class PdfWriter:
             )
             to_add[NameObject("/Dest")] = dest.dest_array
 
-        ind_obj = self._add_object(to_add)
+        page.annotations.append(self._add_object(to_add))
 
-        page.annotations.append(ind_obj)
+        if to_add.get("/Subtype") == "/Popup" and NameObject("/Parent") in to_add:
+            cast(DictionaryObject, to_add["/Parent"].get_object())[
+                NameObject("/Popup")
+            ] = to_add.indirect_reference
+
+        return to_add
 
     def clean_page(self, page: Union[PageObject, IndirectObject]) -> PageObject:
         """
         Perform some clean up in the page.
-        Currently: convert NameObject nameddestination to TextStringObject
+        Currently: convert NameObject named destination to TextStringObject
         (required for names/dests list)
 
         Args:
-          page:
+            page:
 
         Returns:
-          The cleaned PageObject
+            The cleaned PageObject
+
         """
         page = cast("PageObject", page.get_object())
         for a in page.get("/Annots", []):
@@ -2362,7 +2519,7 @@ class PdfWriter:
 
     def _create_stream(
         self, fileobj: Union[Path, StrByteType, PdfReader]
-    ) -> Tuple[IOBase, Optional[Encryption]]:
+    ) -> tuple[IOBase, Optional[Encryption]]:
         # If the fileobj parameter is a string, assume it is a path
         # and create a file object at that location. If it is a file,
         # copy the file's contents into a BytesIO stream object; if
@@ -2389,7 +2546,7 @@ class PdfWriter:
             stream = BytesIO(filecontent)
         else:
             raise NotImplementedError(
-                "PdfMerger.merge requires an object that PdfReader can parse. "
+                "Merging requires an object that PdfReader can parse. "
                 "Typically, that is a Path or a string representing a Path, "
                 "a file object, or an object implementing .seek and .read. "
                 "Passing a PdfReader directly works as well."
@@ -2400,13 +2557,18 @@ class PdfWriter:
         self,
         fileobj: Union[StrByteType, PdfReader, Path],
         outline_item: Union[
-            str, None, PageRange, Tuple[int, int], Tuple[int, int, int], List[int]
+            str, None, PageRange, tuple[int, int], tuple[int, int, int], list[int]
         ] = None,
         pages: Union[
-            None, PageRange, Tuple[int, int], Tuple[int, int, int], List[int]
+            None,
+            PageRange,
+            tuple[int, int],
+            tuple[int, int, int],
+            list[int],
+            list[PageObject],
         ] = None,
         import_outline: bool = True,
-        excluded_fields: Optional[Union[List[str], Tuple[str, ...]]] = None,
+        excluded_fields: Optional[Union[list[str], tuple[str, ...]]] = None,
     ) -> None:
         """
         Identical to the :meth:`merge()<merge>` method, but assumes you want to
@@ -2414,23 +2576,24 @@ class PdfWriter:
         position.
 
         Args:
-          fileobj: A File Object or an object that supports the standard
-            read and seek methods similar to a File Object. Could also be a
-            string representing a path to a PDF file.
-          outline_item: Optionally, you may specify a string to build an outline
-            (aka 'bookmark') to identify the
-            beginning of the included file.
-          pages: Can be a :class:`PageRange<pypdf.pagerange.PageRange>`
-            or a ``(start, stop[, step])`` tuple
-            or a list of pages to be processed
-            to merge only the specified range of pages from the source
-            document into the output document.
-          import_outline: You may prevent the source document's
-            outline (collection of outline items, previously referred to as
-            'bookmarks') from being imported by specifying this as ``False``.
-          excluded_fields: Provide the list of fields/keys to be ignored
-            if ``/Annots`` is part of the list, the annotation will be ignored
-            if ``/B`` is part of the list, the articles will be ignored
+            fileobj: A File Object or an object that supports the standard
+                read and seek methods similar to a File Object. Could also be a
+                string representing a path to a PDF file.
+            outline_item: Optionally, you may specify a string to build an
+                outline (aka 'bookmark') to identify the beginning of the
+                included file.
+            pages: Can be a :class:`PageRange<pypdf.pagerange.PageRange>`
+                or a ``(start, stop[, step])`` tuple
+                or a list of pages to be processed
+                to merge only the specified range of pages from the source
+                document into the output document.
+            import_outline: You may prevent the source document's
+                outline (collection of outline items, previously referred to as
+                'bookmarks') from being imported by specifying this as ``False``.
+            excluded_fields: Provide the list of fields/keys to be ignored
+                if ``/Annots`` is part of the list, the annotation will be ignored
+                if ``/B`` is part of the list, the articles will be ignored
+
         """
         if excluded_fields is None:
             excluded_fields = ()
@@ -2440,51 +2603,66 @@ class PdfWriter:
                     excluded_fields = import_outline
                 import_outline = pages
             pages = outline_item
-            self.merge(None, fileobj, None, pages, import_outline, excluded_fields)
-        else:  # if isinstance(outline_item,str):
             self.merge(
-                None, fileobj, outline_item, pages, import_outline, excluded_fields
+                None,
+                fileobj,
+                None,
+                pages,
+                import_outline,
+                excluded_fields,
+            )
+        else:  # if isinstance(outline_item, str):
+            self.merge(
+                None,
+                fileobj,
+                outline_item,
+                pages,
+                import_outline,
+                excluded_fields,
             )
 
-    @deprecation_bookmark(bookmark="outline_item", import_bookmarks="import_outline")
     def merge(
         self,
         position: Optional[int],
         fileobj: Union[Path, StrByteType, PdfReader],
         outline_item: Optional[str] = None,
-        pages: Optional[PageRangeSpec] = None,
+        pages: Optional[Union[PageRangeSpec, list[PageObject]]] = None,
         import_outline: bool = True,
-        excluded_fields: Optional[Union[List[str], Tuple[str, ...]]] = (),
+        excluded_fields: Optional[Union[list[str], tuple[str, ...]]] = (),
     ) -> None:
         """
         Merge the pages from the given file into the output file at the
         specified page number.
 
         Args:
-          position: The *page number* to insert this file. File will
-            be inserted after the given number.
-          fileobj: A File Object or an object that supports the standard
-            read and seek methods similar to a File Object. Could also be a
-            string representing a path to a PDF file.
-          outline_item: Optionally, you may specify a string to build an outline
-            (aka 'bookmark') to identify the
-            beginning of the included file.
-          pages: can be a :class:`PageRange<pypdf.pagerange.PageRange>`
-            or a ``(start, stop[, step])`` tuple
-            or a list of pages to be processed
-            to merge only the specified range of pages from the source
-            document into the output document.
-          import_outline: You may prevent the source document's
-            outline (collection of outline items, previously referred to as
-            'bookmarks') from being imported by specifying this as ``False``.
-          excluded_fields: provide the list of fields/keys to be ignored
-            if ``/Annots`` is part of the list, the annotation will be ignored
-            if ``/B`` is part of the list, the articles will be ignored
+            position: The *page number* to insert this file. File will
+                be inserted after the given number.
+            fileobj: A File Object or an object that supports the standard
+                read and seek methods similar to a File Object. Could also be a
+                string representing a path to a PDF file.
+            outline_item: Optionally, you may specify a string to build an outline
+                (aka 'bookmark') to identify the
+                beginning of the included file.
+            pages: can be a :class:`PageRange<pypdf.pagerange.PageRange>`
+                or a ``(start, stop[, step])`` tuple
+                or a list of pages to be processed
+                to merge only the specified range of pages from the source
+                document into the output document.
+            import_outline: You may prevent the source document's
+                outline (collection of outline items, previously referred to as
+                'bookmarks') from being imported by specifying this as ``False``.
+            excluded_fields: provide the list of fields/keys to be ignored
+                if ``/Annots`` is part of the list, the annotation will be ignored
+                if ``/B`` is part of the list, the articles will be ignored
+
+        Raises:
+            TypeError: The pages attribute is not configured properly
+
         """
-        if isinstance(fileobj, PdfReader):
+        if isinstance(fileobj, PdfDocCommon):
             reader = fileobj
         else:
-            stream, encryption_obj = self._create_stream(fileobj)
+            stream, _encryption_obj = self._create_stream(fileobj)
             # Create a new PdfReader instance using the stream
             # (either file or BytesIO or StringIO) created above
             reader = PdfReader(stream, strict=False)  # type: ignore[arg-type]
@@ -2493,7 +2671,7 @@ class PdfWriter:
             excluded_fields = ()
         # Find the range of pages to merge.
         if pages is None:
-            pages = list(range(0, len(reader.pages)))
+            pages = list(range(len(reader.pages)))
         elif isinstance(pages, PageRange):
             pages = list(range(*pages.indices(len(reader.pages))))
         elif isinstance(pages, list):
@@ -2506,35 +2684,33 @@ class PdfWriter:
             )
 
         srcpages = {}
-        for i in pages:
-            pg = reader.pages[i]
+        for page in pages:
+            if isinstance(page, PageObject):
+                pg = page
+            else:
+                pg = reader.pages[page]
             assert pg.indirect_reference is not None
             if position is None:
+                # numbers in the exclude list identifies that the exclusion is
+                # only applicable to 1st level of cloning
                 srcpages[pg.indirect_reference.idnum] = self.add_page(
-                    pg, list(excluded_fields) + ["/B", "/Annots"]  # type: ignore
+                    pg, [*list(excluded_fields), 1, "/B", 1, "/Annots"]  # type: ignore
                 )
             else:
                 srcpages[pg.indirect_reference.idnum] = self.insert_page(
-                    pg, position, list(excluded_fields) + ["/B", "/Annots"]  # type: ignore
+                    pg, position, [*list(excluded_fields), 1, "/B", 1, "/Annots"]  # type: ignore
                 )
                 position += 1
             srcpages[pg.indirect_reference.idnum].original_page = pg
 
-        reader._namedDests = (
+        reader._named_destinations = (
             reader.named_destinations
         )  # need for the outline processing below
-        for dest in reader._namedDests.values():
-            arr = dest.dest_array
-            # try:
-            if isinstance(dest["/Page"], NullObject):
-                pass  # self.add_named_destination_array(dest["/Title"],arr)
-            elif dest["/Page"].indirect_reference.idnum in srcpages:
-                arr[NumberObject(0)] = srcpages[
-                    dest["/Page"].indirect_reference.idnum
-                ].indirect_reference
-                self.add_named_destination_array(dest["/Title"], arr)
-            # except Exception as e:
-            #    logger_warning(f"can not insert {dest} : {e.msg}",__name__)
+
+        arr: Any
+
+        for dest in reader._named_destinations.values():
+            self._merge__process_named_dests(dest=dest, reader=reader, srcpages=srcpages)
 
         outline_item_typ: TreeObject
         if outline_item is not None:
@@ -2542,52 +2718,116 @@ class PdfWriter:
                 "TreeObject",
                 self.add_outline_item(
                     TextStringObject(outline_item),
-                    list(srcpages.values())[0].indirect_reference,
+                    next(iter(srcpages.values())).indirect_reference,
                     fit=PAGE_FIT,
                 ).get_object(),
             )
         else:
             outline_item_typ = self.get_outline_root()
 
-        _ro = cast("DictionaryObject", reader.trailer[TK.ROOT])
+        _ro = reader.root_object
         if import_outline and CO.OUTLINES in _ro:
             outline = self._get_filtered_outline(
                 _ro.get(CO.OUTLINES, None), srcpages, reader
             )
             self._insert_filtered_outline(
                 outline, outline_item_typ, None
-            )  # TODO : use before parameter
+            )  # TODO: use before parameter
 
         if "/Annots" not in excluded_fields:
             for pag in srcpages.values():
                 lst = self._insert_filtered_annotations(
-                    pag.original_page.get("/Annots", ()), pag, srcpages, reader
+                    pag.original_page.get("/Annots", []), pag, srcpages, reader
                 )
                 if len(lst) > 0:
                     pag[NameObject("/Annots")] = lst
                 self.clean_page(pag)
 
+        if "/AcroForm" in _ro and not is_null_or_none(_ro["/AcroForm"]):
+            if "/AcroForm" not in self._root_object:
+                self._root_object[NameObject("/AcroForm")] = self._add_object(
+                    cast(
+                        DictionaryObject,
+                        reader.root_object["/AcroForm"],
+                    ).clone(self, False, ("/Fields",))
+                )
+                arr = ArrayObject()
+            else:
+                arr = cast(
+                    ArrayObject,
+                    cast(DictionaryObject, self._root_object["/AcroForm"])["/Fields"],
+                )
+            trslat = self._id_translated[id(reader)]
+            try:
+                for f in reader.root_object["/AcroForm"]["/Fields"]:  # type: ignore
+                    try:
+                        ind = IndirectObject(trslat[f.idnum], 0, self)
+                        if ind not in arr:
+                            arr.append(ind)
+                    except KeyError:
+                        # for trslat[] which mean the field has not be copied
+                        # through the page
+                        pass
+            except KeyError:  # for /Acroform or /Fields are not existing
+                arr = self._add_object(ArrayObject())
+            cast(DictionaryObject, self._root_object["/AcroForm"])[
+                NameObject("/Fields")
+            ] = arr
+
         if "/B" not in excluded_fields:
             self.add_filtered_articles("", srcpages, reader)
 
-        return
+    def _merge__process_named_dests(self, dest: Any, reader: PdfDocCommon, srcpages: dict[int, PageObject]) -> None:
+        arr: Any = dest.dest_array
+        if "/Names" in self._root_object and dest["/Title"] in cast(
+            list[Any],
+            cast(
+                DictionaryObject,
+                cast(DictionaryObject, self._root_object["/Names"]).get("/Dests", DictionaryObject()),
+            ).get("/Names", DictionaryObject()),
+        ):
+            # already exists: should not duplicate it
+            pass
+        elif dest["/Page"] is None or isinstance(dest["/Page"], NullObject):
+            pass
+        elif isinstance(dest["/Page"], int):
+            # the page reference is a page number normally not a PDF Reference
+            # page numbers as int are normally accepted only in external goto
+            try:
+                p = reader.pages[dest["/Page"]]
+            except IndexError:
+                return
+            assert p.indirect_reference is not None
+            try:
+                arr[NumberObject(0)] = NumberObject(
+                    srcpages[p.indirect_reference.idnum].page_number
+                )
+                self.add_named_destination_array(dest["/Title"], arr)
+            except KeyError:
+                pass
+        elif dest["/Page"].indirect_reference.idnum in srcpages:
+            arr[NumberObject(0)] = srcpages[
+                dest["/Page"].indirect_reference.idnum
+            ].indirect_reference
+            self.add_named_destination_array(dest["/Title"], arr)
 
     def _add_articles_thread(
         self,
         thread: DictionaryObject,  # thread entry from the reader's array of threads
-        pages: Dict[int, PageObject],
+        pages: dict[int, PageObject],
         reader: PdfReader,
     ) -> IndirectObject:
         """
-        Clone the thread with only the applicable articles
+        Clone the thread with only the applicable articles.
 
         Args:
-          thread:
-          pages:
-          reader:
+            thread:
+            pages:
+            reader:
 
         Returns:
-          The added thread as an indirect reference
+            The added thread as an indirect reference
+
         """
         nthread = thread.clone(
             self, force_duplicate=True, ignore_fields=("/F",)
@@ -2638,17 +2878,20 @@ class PdfWriter:
 
     def add_filtered_articles(
         self,
-        fltr: Union[Pattern, str],  # thread entry from the reader's array of threads
-        pages: Dict[int, PageObject],
+        fltr: Union[
+            Pattern[Any], str
+        ],  # thread entry from the reader's array of threads
+        pages: dict[int, PageObject],
         reader: PdfReader,
     ) -> None:
         """
-        Add articles matching the defined criteria
+        Add articles matching the defined criteria.
 
         Args:
-          fltr:
-          pages:
-          reader:
+            fltr:
+            pages:
+            reader:
+
         """
         if isinstance(fltr, str):
             fltr = re.compile(fltr)
@@ -2657,25 +2900,27 @@ class PdfWriter:
         for p in pages.values():
             pp = p.original_page
             for a in pp.get("/B", ()):
-                thr = a.get_object()["/T"]
+                a_obj = a.get_object()
+                if is_null_or_none(a_obj):
+                    continue
+                thr = a_obj.get("/T")
+                if thr is None:
+                    continue
+                thr = thr.get_object()
                 if thr.indirect_reference.idnum not in self._id_translated[
                     id(reader)
-                ] and fltr.search(thr["/I"]["/Title"]):
+                ] and fltr.search((thr.get("/I", {})).get("/Title", "")):
                     self._add_articles_thread(thr, pages, reader)
 
     def _get_cloned_page(
         self,
-        page: Union[None, int, IndirectObject, PageObject, NullObject],
-        pages: Dict[int, PageObject],
+        page: Union[None, IndirectObject, PageObject, NullObject],
+        pages: dict[int, PageObject],
         reader: PdfReader,
     ) -> Optional[IndirectObject]:
         if isinstance(page, NullObject):
             return None
-        if isinstance(page, int):
-            _i = reader.pages[page].indirect_reference
-        # elif isinstance(page, PageObject):
-        #    _i = page.indirect_reference
-        elif isinstance(page, DictionaryObject) and page.get("/Type", "") == "/Page":
+        if isinstance(page, DictionaryObject) and page.get("/Type", "") == "/Page":
             _i = page.indirect_reference
         elif isinstance(page, IndirectObject):
             _i = page
@@ -2686,14 +2931,19 @@ class PdfWriter:
 
     def _insert_filtered_annotations(
         self,
-        annots: Union[IndirectObject, List[DictionaryObject]],
+        annots: Union[IndirectObject, list[DictionaryObject], None],
         page: PageObject,
-        pages: Dict[int, PageObject],
+        pages: dict[int, PageObject],
         reader: PdfReader,
-    ) -> List[Destination]:
+    ) -> list[Destination]:
         outlist = ArrayObject()
         if isinstance(annots, IndirectObject):
-            annots = cast("List", annots.get_object())
+            annots = cast("list[Any]", annots.get_object())
+        if annots is None:
+            return outlist
+        if not isinstance(annots, list):
+            logger_warning(f"Expected list of annotations, got {annots} of type {annots.__class__.__name__}.", __name__)
+            return outlist
         for an in annots:
             ano = cast("DictionaryObject", an.get_object())
             if (
@@ -2703,7 +2953,7 @@ class PdfWriter:
                 or "/Dest" in ano
             ):
                 if "/Dest" not in ano:
-                    outlist.append(ano.clone(self).indirect_reference)
+                    outlist.append(self._add_object(ano.clone(self)))
                 else:
                     d = ano["/Dest"]
                     if isinstance(d, str):
@@ -2715,10 +2965,12 @@ class PdfWriter:
                         p = self._get_cloned_page(d[0], pages, reader)
                         if p is not None:
                             anc = ano.clone(self, ignore_fields=("/Dest",))
-                            anc[NameObject("/Dest")] = ArrayObject([p] + d[1:])
-                            outlist.append(anc.indirect_reference)
+                            anc[NameObject("/Dest")] = ArrayObject([p, *d[1:]])
+                            outlist.append(self._add_object(anc))
             else:
-                d = cast("DictionaryObject", ano["/A"])["/D"]
+                d = cast("DictionaryObject", ano["/A"]).get("/D", NullObject())
+                if is_null_or_none(d):
+                    continue
                 if isinstance(d, str):
                     # it is a named dest
                     if str(d) in self.get_named_dest_root():
@@ -2728,32 +2980,36 @@ class PdfWriter:
                     p = self._get_cloned_page(d[0], pages, reader)
                     if p is not None:
                         anc = ano.clone(self, ignore_fields=("/D",))
-                        anc = cast("DictionaryObject", anc)
                         cast("DictionaryObject", anc["/A"])[
                             NameObject("/D")
-                        ] = ArrayObject([p] + d[1:])
-                        outlist.append(anc.indirect_reference)
+                        ] = ArrayObject([p, *d[1:]])
+                        outlist.append(self._add_object(anc))
         return outlist
 
     def _get_filtered_outline(
         self,
         node: Any,
-        pages: Dict[int, PageObject],
+        pages: dict[int, PageObject],
         reader: PdfReader,
-    ) -> List[Destination]:
+    ) -> list[Destination]:
         """
         Extract outline item entries that are part of the specified page set.
 
         Args:
-          node:
-          pages:
-          reader:
+            node:
+            pages:
+            reader:
 
         Returns:
-          A list of destination objects.
+            A list of destination objects.
+
         """
         new_outline = []
+        if node is None:
+            node = NullObject()
         node = node.get_object()
+        if is_null_or_none(node):
+            node = DictionaryObject()
         if node.get("/Type", "") == "/Outlines" or "/Title" not in node:
             node = node.get("/First", None)
             if node is not None:
@@ -2769,10 +3025,15 @@ class PdfWriter:
                     v = NullObject()
                 o[NameObject("/Page")] = v
                 if "/First" in node:
-                    o.childs = self._get_filtered_outline(node["/First"], pages, reader)
+                    o._filtered_children = self._get_filtered_outline(
+                        node["/First"], pages, reader
+                    )
                 else:
-                    o.childs = []
-                if not isinstance(o["/Page"], NullObject) or len(o.childs) > 0:
+                    o._filtered_children = []
+                if (
+                    not isinstance(o["/Page"], NullObject)
+                    or len(o._filtered_children) > 0
+                ):
                     new_outline.append(o)
                 node = node.get("/Next", None)
         return new_outline
@@ -2784,10 +3045,6 @@ class PdfWriter:
         if not isinstance(dest["/Page"], NullObject):
             if dest.node is not None and "/A" in dest.node:
                 n_ol[NameObject("/A")] = dest.node["/A"].clone(self)
-            # elif "/D" in dest.node:
-            #    n_ol[NameObject("/Dest")] = dest.node["/D"].clone(self)
-            # elif "/Dest" in dest.node:
-            #    n_ol[NameObject("/Dest")] = dest.node["/Dest"].clone(self)
             else:
                 n_ol[NameObject("/Dest")] = dest.dest_array
         # TODO: /SE
@@ -2802,30 +3059,29 @@ class PdfWriter:
 
     def _insert_filtered_outline(
         self,
-        outlines: List[Destination],
+        outlines: list[Destination],
         parent: Union[TreeObject, IndirectObject],
         before: Union[None, TreeObject, IndirectObject] = None,
     ) -> None:
         for dest in outlines:
-            # TODO  : can be improved to keep A and SE entries (ignored for the moment)
-            # np=self.add_outline_item_destination(dest,parent,before)
+            # TODO: can be improved to keep A and SE entries (ignored for the moment)
+            # with np=self.add_outline_item_destination(dest,parent,before)
             if dest.get("/Type", "") == "/Outlines" or "/Title" not in dest:
                 np = parent
             else:
                 np = self._clone_outline(dest)
                 cast(TreeObject, parent.get_object()).insert_child(np, before, self)
-            self._insert_filtered_outline(dest.childs, np, None)
+            self._insert_filtered_outline(dest._filtered_children, np, None)
 
     def close(self) -> None:
-        """To match the functions from Merger"""
+        """Implemented for API harmonization."""
         return
 
-    # @deprecation_bookmark(bookmark="outline_item")
     def find_outline_item(
         self,
-        outline_item: Dict[str, Any],
+        outline_item: dict[str, Any],
         root: Optional[OutlineType] = None,
-    ) -> Optional[List[int]]:
+    ) -> Optional[list[int]]:
         if root is None:
             o = self.get_outline_root()
         else:
@@ -2838,41 +3094,31 @@ class PdfWriter:
                 or o.get("/Title", None) == outline_item
             ):
                 return [i]
-            else:
-                if "/First" in o:
-                    res = self.find_outline_item(
-                        outline_item, cast(OutlineType, o["/First"])
-                    )
-                    if res:
-                        return ([i] if "/Title" in o else []) + res
+            if "/First" in o:
+                res = self.find_outline_item(
+                    outline_item, cast(OutlineType, o["/First"])
+                )
+                if res:
+                    return ([i] if "/Title" in o else []) + res
             if "/Next" in o:
                 i += 1
                 o = cast(TreeObject, o["/Next"])
             else:
                 return None
-
-    @deprecation_bookmark(bookmark="outline_item")
-    def find_bookmark(
-        self,
-        outline_item: Dict[str, Any],
-        root: Optional[OutlineType] = None,
-    ) -> Optional[List[int]]:  # deprecated
-        """
-        .. deprecated:: 2.9.0
-            Use :meth:`find_outline_item` instead.
-        """
-        return self.find_outline_item(outline_item, root)
+        raise PyPdfError("This line is theoretically unreachable.")  # pragma: no cover
 
     def reset_translation(
         self, reader: Union[None, PdfReader, IndirectObject] = None
     ) -> None:
         """
-        reset the translation table between reader and the writer object.
-        late cloning will create new independent objects
+        Reset the translation table between reader and the writer object.
+
+        Late cloning will create new independent objects.
 
         Args:
-          reader: PdfReader or IndirectObject refering a PdfReader object.
-            if set to None or omitted, all tables will be reset.
+            reader: PdfReader or IndirectObject referencing a PdfReader object.
+                if set to None or omitted, all tables will be reset.
+
         """
         if reader is None:
             self._id_translated = {}
@@ -2902,38 +3148,41 @@ class PdfWriter:
 
         Page indexes must be given starting from 0.
         Labels must have a style, a prefix or both.
-        If to a range is not assigned any page label a decimal label starting from 1 is applied.
+        If a range is not assigned any page label, a decimal label starting from 1 is applied.
 
         Args:
             page_index_from: page index of the beginning of the range starting from 0
             page_index_to: page index of the beginning of the range starting from 0
-            style:  The numbering style to be used for the numeric portion of each page label:
-                        '/D' Decimal arabic numerals
-                        '/R' Uppercase roman numerals
-                        '/r' Lowercase roman numerals
-                        '/A' Uppercase letters (A to Z for the first 26 pages,
-                             AA to ZZ for the next 26, and so on)
-                        '/a' Lowercase letters (a to z for the first 26 pages,
-                             aa to zz for the next 26, and so on)
+            style: The numbering style to be used for the numeric portion of each page label:
+
+                       * ``/D`` Decimal Arabic numerals
+                       * ``/R`` Uppercase Roman numerals
+                       * ``/r`` Lowercase Roman numerals
+                       * ``/A`` Uppercase letters (A to Z for the first 26 pages,
+                         AA to ZZ for the next 26, and so on)
+                       * ``/a`` Lowercase letters (a to z for the first 26 pages,
+                         aa to zz for the next 26, and so on)
+
             prefix: The label prefix for page labels in this range.
             start:  The value of the numeric portion for the first page label
                     in the range.
                     Subsequent pages are numbered sequentially from this value,
                     which must be greater than or equal to 1.
                     Default value: 1.
+
         """
         if style is None and prefix is None:
-            raise ValueError("at least one between style and prefix must be given")
+            raise ValueError("At least one of style and prefix must be given")
         if page_index_from < 0:
-            raise ValueError("page_index_from must be equal or greater then 0")
+            raise ValueError("page_index_from must be greater or equal than 0")
         if page_index_to < page_index_from:
             raise ValueError(
-                "page_index_to must be equal or greater then page_index_from"
+                "page_index_to must be greater or equal than page_index_from"
             )
         if page_index_to >= len(self.pages):
             raise ValueError("page_index_to exceeds number of pages")
         if start is not None and start != 0 and start < 1:
-            raise ValueError("if given, start must be equal or greater than one")
+            raise ValueError("If given, start must be greater or equal than one")
 
         self._set_page_label(page_index_from, page_index_to, style, prefix, start)
 
@@ -2947,18 +3196,18 @@ class PdfWriter:
     ) -> None:
         """
         Set a page label to a range of pages.
+
         Page indexes must be given starting from 0.
         Labels must have a style, a prefix or both.
-        If to a range is not assigned any page label a decimal label starting
-        from 1 is applied.
+        If a range is not assigned any page label a decimal label starting from 1 is applied.
 
         Args:
             page_index_from: page index of the beginning of the range starting from 0
             page_index_to: page index of the beginning of the range starting from 0
             style:  The numbering style to be used for the numeric portion of each page label:
-                        /D Decimal arabic numerals
-                        /R Uppercase roman numerals
-                        /r Lowercase roman numerals
+                        /D Decimal Arabic numerals
+                        /R Uppercase Roman numerals
+                        /r Lowercase Roman numerals
                         /A Uppercase letters (A to Z for the first 26 pages,
                            AA to ZZ for the next 26, and so on)
                         /a Lowercase letters (a to z for the first 26 pages,
@@ -2968,6 +3217,7 @@ class PdfWriter:
                     in the range.
                     Subsequent pages are numbered sequentially from this value,
                     which must be greater than or equal to 1. Default value: 1.
+
         """
         default_page_label = DictionaryObject()
         default_page_label[NameObject("/S")] = NameObject("/D")
@@ -3001,39 +3251,63 @@ class PdfWriter:
         page_labels[NameObject("/Nums")] = nums
         self._root_object[NameObject(CatalogDictionary.PAGE_LABELS)] = page_labels
 
+    def _repr_mimebundle_(
+        self,
+        include: Union[None, Iterable[str]] = None,
+        exclude: Union[None, Iterable[str]] = None,
+    ) -> dict[str, Any]:
+        """
+        Integration into Jupyter Notebooks.
 
-def _pdf_objectify(obj: Union[Dict[str, Any], str, int, List[Any]]) -> PdfObject:
+        This method returns a dictionary that maps a mime-type to its
+        representation.
+
+        .. seealso::
+
+           https://ipython.readthedocs.io/en/stable/config/integrating.html
+        """
+        pdf_data = BytesIO()
+        self.write(pdf_data)
+        data = {
+            "application/pdf": pdf_data,
+        }
+
+        if include is not None:
+            # Filter representations based on include list
+            data = {k: v for k, v in data.items() if k in include}
+
+        if exclude is not None:
+            # Remove representations based on exclude list
+            data = {k: v for k, v in data.items() if k not in exclude}
+
+        return data
+
+
+def _pdf_objectify(obj: Union[dict[str, Any], str, float, list[Any]]) -> PdfObject:
     if isinstance(obj, PdfObject):
         return obj
     if isinstance(obj, dict):
         to_add = DictionaryObject()
         for key, value in obj.items():
-            name_key = NameObject(key)
-            casted_value = _pdf_objectify(value)
-            to_add[name_key] = casted_value
+            to_add[NameObject(key)] = _pdf_objectify(value)
         return to_add
-    elif isinstance(obj, list):
-        arr = ArrayObject()
-        for el in obj:
-            arr.append(_pdf_objectify(el))
-        return arr
-    elif isinstance(obj, str):
+    if isinstance(obj, str):
         if obj.startswith("/"):
             return NameObject(obj)
-        else:
-            return TextStringObject(obj)
-    elif isinstance(obj, (int, float)):
+        return TextStringObject(obj)
+    if isinstance(obj, (float, int)):
         return FloatObject(obj)
-    else:
-        raise NotImplementedError(
-            f"type(obj)={type(obj)} could not be casted to PdfObject"
-        )
+    if isinstance(obj, list):
+        return ArrayObject(_pdf_objectify(i) for i in obj)
+    raise NotImplementedError(
+        f"{type(obj)=} could not be cast to a PdfObject"
+    )
 
 
 def _create_outline_item(
     action_ref: Union[None, IndirectObject],
     title: str,
-    color: Union[Tuple[float, float, float], str, None],
+    color: Union[tuple[float, float, float], str, None],
     italic: bool,
     bold: bool,
 ) -> TreeObject:
@@ -3048,25 +3322,14 @@ def _create_outline_item(
     if color:
         if isinstance(color, str):
             color = hex_to_rgb(color)
-        prec = decimal.Decimal("1.00000")
         outline_item.update(
-            {
-                NameObject("/C"): ArrayObject(
-                    [FloatObject(decimal.Decimal(c).quantize(prec)) for c in color]
-                )
-            }
+            {NameObject("/C"): ArrayObject([FloatObject(c) for c in color])}
         )
     if italic or bold:
         format_flag = 0
         if italic:
-            format_flag += 1
+            format_flag += OutlineFontFlag.italic
         if bold:
-            format_flag += 2
+            format_flag += OutlineFontFlag.bold
         outline_item.update({NameObject("/F"): NumberObject(format_flag)})
     return outline_item
-
-
-class PdfFileWriter(PdfWriter):  # deprecated
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        deprecation_with_replacement("PdfFileWriter", "PdfWriter", "3.0.0")
-        super().__init__(*args, **kwargs)

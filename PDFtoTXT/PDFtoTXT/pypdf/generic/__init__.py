@@ -29,11 +29,7 @@
 __author__ = "Mathieu Fenniak"
 __author_email__ = "biziqe@mathieu.fenniak.net"
 
-from typing import Dict, List, Union
-
-from .._utils import StreamType, deprecate_with_replacement
 from ..constants import OutlineFontFlag
-from ._annotations import AnnotationBuilder
 from ._base import (
     BooleanObject,
     ByteStringObject,
@@ -45,6 +41,7 @@ from ._base import (
     PdfObject,
     TextStringObject,
     encode_pdfdocencoding,
+    is_null_or_none,
 )
 from ._data_structures import (
     ArrayObject,
@@ -58,8 +55,10 @@ from ._data_structures import (
     TreeObject,
     read_object,
 )
+from ._files import EmbeddedFile
 from ._fit import Fit
-from ._outline import Bookmark, OutlineItem
+from ._link import DirectReferenceLink, NamedReferenceLink, ReferenceLink, extract_links
+from ._outline import OutlineItem
 from ._rectangle import RectangleObject
 from ._utils import (
     create_string_object,
@@ -68,77 +67,49 @@ from ._utils import (
     read_hex_string_from_stream,
     read_string_from_stream,
 )
-
-
-def readHexStringFromStream(
-    stream: StreamType,
-) -> Union["TextStringObject", "ByteStringObject"]:  # deprecated
-    deprecate_with_replacement(
-        "readHexStringFromStream", "read_hex_string_from_stream", "4.0.0"
-    )
-    return read_hex_string_from_stream(stream)
-
-
-def readStringFromStream(
-    stream: StreamType,
-    forced_encoding: Union[None, str, List[str], Dict[int, str]] = None,
-) -> Union["TextStringObject", "ByteStringObject"]:  # deprecated
-    deprecate_with_replacement(
-        "readStringFromStream", "read_string_from_stream", "4.0.0"
-    )
-    return read_string_from_stream(stream, forced_encoding)
-
-
-def createStringObject(
-    string: Union[str, bytes],
-    forced_encoding: Union[None, str, List[str], Dict[int, str]] = None,
-) -> Union[TextStringObject, ByteStringObject]:  # deprecated
-    deprecate_with_replacement("createStringObject", "create_string_object", "4.0.0")
-    return create_string_object(string, forced_encoding)
-
+from ._viewerpref import ViewerPreferences
 
 PAGE_FIT = Fit.fit()
 
 
 __all__ = [
-    # Base types
-    "BooleanObject",
-    "FloatObject",
-    "NumberObject",
-    "NameObject",
-    "IndirectObject",
-    "NullObject",
-    "PdfObject",
-    "TextStringObject",
-    "ByteStringObject",
-    # Annotations
-    "AnnotationBuilder",
-    # Fit
-    "Fit",
     "PAGE_FIT",
-    # Data structures
     "ArrayObject",
-    "DictionaryObject",
-    "TreeObject",
-    "StreamObject",
-    "DecodedStreamObject",
-    "EncodedStreamObject",
+    "BooleanObject",
+    "ByteStringObject",
     "ContentStream",
-    "RectangleObject",
-    "Field",
+    "DecodedStreamObject",
     "Destination",
-    # --- More specific stuff
-    # Outline
-    "OutlineItem",
+    "DictionaryObject",
+    "DirectReferenceLink",
+    "EmbeddedFile",
+    "EncodedStreamObject",
+    "Field",
+    "Fit",
+    "FloatObject",
+    "IndirectObject",
+    "NameObject",
+    "NamedReferenceLink",
+    "NullObject",
+    "NumberObject",
     "OutlineFontFlag",
-    "Bookmark",
-    # Data structures core functions
-    "read_object",
+    "OutlineItem",
+    "PdfObject",
+    "RectangleObject",
+    "ReferenceLink",
+    "StreamObject",
+    "TextStringObject",
+    "TreeObject",
+    "ViewerPreferences",
     # Utility functions
     "create_string_object",
-    "encode_pdfdocencoding",
     "decode_pdfdocencoding",
+    "encode_pdfdocencoding",
+    "extract_links",
     "hex_to_rgb",
+    "is_null_or_none",
     "read_hex_string_from_stream",
+    # Data structures core functions
+    "read_object",
     "read_string_from_stream",
 ]

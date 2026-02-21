@@ -1,0 +1,18 @@
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.10
+  build:
+    commands:
+      - echo "Starting clean package..."
+      # Updated paths to match your GitHub folder structure
+      - aws cloudformation package --template-file PDFtoTXT/PDFtoTXT/pdftotxt.yaml --s3-bucket search-artifacts-store --output-template-file temp.yaml
+      # This line removes the hidden characters that break CloudFormation
+      - sed '1s/^\xef\xbb\xbf//' temp.yaml > lambdaoutput.yaml
+
+artifacts:
+  files:
+    - lambdaoutput.yaml
+    - PDFtoTXT/PDFtoTXT/pdftotxt.yaml
