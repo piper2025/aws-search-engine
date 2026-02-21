@@ -12,7 +12,7 @@ phases:
   post_build:
     commands:
       - echo "Deploying updated Lambda..."
-      - aws cloudformation deploy --template-file lambdaoutput.yaml --stack-name pdf-to-text-stack --capabilities CAPABILITY_IAM
+      - aws cloudformation deploy --template-file lambdaoutput.yaml --stack-name pdf-automation-v1 --capabilities CAPABILITY_IAM
 artifacts:
   files:
     - lambdaoutput.yaml
