@@ -2,63 +2,57 @@ import boto3
 import json
 import os
 import logging
-import pkg_resources
-import pypdf
-from pypdf import PdfReader
+import urllib.parse
 from io import BytesIO
-from io import StringIO
 
+# Robust Library Import
+try:
+    from pypdf import PdfReader
+except ImportError:
+    import pypdf
+    PdfReader = pypdf.PdfReader
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-
 def lambda_handler(event, context):
-    logger.info('********************** Environment and Event variables are *********************')
-    logger.info(os.environ)
-    logger.info(event)
-    extract_content(event)
-
-    return {
-        'statusCode': 200,
-        'body': json.dumps('Execution is now complete')
-    }
-
-
-def extract_content(event):
-
+    logger.info(f"Event received: {json.dumps(event)}")
     try:
-        #Read the target bucket from the lambda environment variable
-        targetBucket = os.environ['TARGET_BUCKET']
-    except:
-        targetBucket = "skl-dest"
-    print('Target bucket is', targetBucket)
+        # Get bucket and key
+        bucket = event['Records'][0]['s3']['bucket']['name']
+        raw_key = event['Records'][0]['s3']['object']['key']
+        
+        # CRITICAL FIX: Convert "ID+Card.pdf" back to "ID Card.pdf"
+        key = urllib.parse.unquote_plus(raw_key)
+        logger.info(f"Processing file: {key} from bucket: {bucket}")
+        
+        target_bucket = os.environ.get('TARGET_BUCKET', 'gl-inter-store-2026')
+        s3_client = boto3.client('s3')
 
-    bucket = event['Records'][0]['s3']['bucket']['name']
-    key = event['Records'][0]['s3']['object']['key']
-    print('The s3 bucket is', bucket, 'and the file name is', key)
-    s3client = boto3.client('s3')
-    #csv_buffer = StringIO()
-    response = s3client.get_object(Bucket=bucket, Key=key)
-    obj = s3client.get_object(Bucket=bucket, Key=key)
-    pdffile = response["Body"]
-    print('The binary pdf file type is', type(pdffile))
+        # Download PDF
+        response = s3_client.get_object(Bucket=bucket, Key=key)
+        pdf_bytes = response['Body'].read()
+        
+        # Extract Text
+        reader = PdfReader(BytesIO(pdf_bytes))
+        full_text = ""
+        for page in reader.pages:
+            text = page.extract_text()
+            if text:
+                full_text += text + "\n"
 
-    reader = PdfReader(BytesIO(pdffile.read()))
-    info = reader.metadata
-    title = info.title
-    author = info.author
-    date = info.creation_date
-    page = reader.pages[0]
-    text = page.extract_text()
-    print("Extracted text is ", text)
-    print("Metadata is ", info)
-    print("Title is", title)
-    print("Author is", author)
-    print("Creation date is", date)
-    content = str(title) + "\n" + str(author) + "\n" + str(date) + "\n" + str(text)
-    print("Content is\n" + content)
-    
-    s3client.put_object(Bucket=targetBucket, Key=key+".txt", Body=content)
-
-    print('All done, returning from extract content method')
+        # Define Output Name
+        output_key = key.replace('.pdf', '.txt').replace('.PDF', '.txt')
+        
+        # Upload Text
+        s3_client.put_object(
+            Bucket=target_bucket,
+            Key=output_key,
+            Body=full_text
+        )
+        logger.info(f"Successfully saved {output_key} to {target_bucket}")
+        return {'statusCode': 200, 'body': 'Conversion Successful'}
+        
+    except Exception as e:
+        logger.error(f"FATAL ERROR: {str(e)}")
+        raise e
