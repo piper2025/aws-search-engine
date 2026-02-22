@@ -28,4 +28,4 @@ Resources:
       CodeUri: Upload-to-search/
       MemorySize: 512
       Timeout: 900
-      Role: 'arn:aws:iam:779803046124:role/lambda_s3'
+      Role: 'arn:aws:iam::779803046124:role/lambda_s3'
