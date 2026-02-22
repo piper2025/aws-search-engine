@@ -1,0 +1,31 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: 'AWS::Serverless-2016-10-31'
+Description: Master template for PDF Conversion and Search Indexing.
+
+Resources:
+  # --- Function 1: PDF to Text ---
+  PDFToTextFunction:
+    Type: 'AWS::Serverless::Function'
+    Properties:
+      FunctionName: PDFToText-Automated
+      Handler: lambda_function.lambda_handler
+      Runtime: python3.10
+      CodeUri: PDFtoTXT/
+      MemorySize: 512
+      Timeout: 900
+      Role: 'arn:aws:iam::779803046124:role/lambda_s3'
+      Environment:
+        Variables:
+          TARGET_BUCKET: gl-inter-store-2026
+
+  # --- Function 2: Upload to Search ---
+  UploadToSearchFunction:
+    Type: 'AWS::Serverless::Function'
+    Properties:
+      FunctionName: upload-to-search
+      Handler: lambda_function.lambda_handler
+      Runtime: python3.10
+      CodeUri: Upload-to-search/
+      MemorySize: 512
+      Timeout: 900
+      Role: 'arn:aws:iam::844028273225:role/lambda_s3'
