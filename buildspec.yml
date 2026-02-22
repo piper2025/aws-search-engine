@@ -5,17 +5,15 @@ phases:
     runtime-versions:
       python: 3.10
     commands:
-      - echo "Installing dependencies for PDFtoTXT..."
+      - echo "Installing dependencies..."
       - pip install pypdf typing_extensions -t PDFtoTXT/
-      
-      - echo "Installing dependencies for Upload-to-search..."
       - pip install requests requests_aws4auth -t Upload-to-search/
       
   build:
     commands:
       - echo "Packaging infrastructure..."
-      # This points to your template inside the new clean PDFtoTXT folder
-      - aws cloudformation package --template-file PDFtoTXT/pdftotxt.yaml --s3-bucket search-artifacts-store --output-template-file lambdaoutput.yaml
+      # UPDATED: Pointing to the new 'template.yaml' in the root
+      - aws cloudformation package --template-file template.yaml --s3-bucket search-artifacts-store --output-template-file lambdaoutput.yaml
       
   post_build:
     commands:
