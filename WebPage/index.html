@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Enterprise Search Portal</title>
+    <style>
+        :root { --aws-navy: #232f3e; --aws-orange: #ff9900; }
+        body { font-family: sans-serif; background: #f4f4f4; padding: 20px; }
+        .container { max-width: 800px; margin: auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+        .search-box { display: flex; gap: 10px; margin-bottom: 20px; }
+        input { flex: 1; padding: 12px; border: 1px solid #ccc; border-radius: 4px; }
+        button { padding: 12px 20px; background: var(--aws-orange); color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; }
+        em { background: #fff3cd; font-style: normal; font-weight: bold; padding: 0 2px; }
+        .result-card { border-left: 5px solid var(--aws-orange); padding: 15px; margin-bottom: 15px; background: #fafafa; border-bottom: 1px solid #eee; }
+        .result-title { color: #0073bb; font-size: 1.1em; font-weight: bold; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h2>Cloud Search Portal</h2>
+    <div class="search-box">
+        <input type="text" id="searchInput" placeholder="Search..." onkeypress="if(event.key === 'Enter') performSearch()">
+        <button onclick="performSearch()">Search</button>
+    </div>
+    <div id="status"></div>
+    <div id="resultsList"></div>
+</div>
+
+<script>
+    // The function name must match exactly what is in the onclick/onkeypress above
+    async function performSearch() {
+        const query = document.getElementById('searchInput').value;
+        const resultsList = document.getElementById('resultsList');
+        const status = document.getElementById('status');
+        
+        if (!query) return;
+
+        const API_URL = "https://zao8xesjig.execute-api.us-east-1.amazonaws.com/search-api/";
+        
+        status.innerText = "Searching...";
+        resultsList.innerHTML = "";
+
+        try {
+            const response = await fetch(`${API_URL}?q=${encodeURIComponent(query)}`);
+            const data = await response.json();
+            const hits = data.hits.hits;
+
+            status.innerText = `Found ${data.hits.total.value} results`;
+
+            resultsList.innerHTML = hits.map(hit => {
+                const title = (hit.highlight && hit.highlight.Title) ? hit.highlight.Title[0] : (hit._source.Title || "Untitled");
+                const content = (hit.highlight && hit.highlight.Body) ? hit.highlight.Body.join(' ... ') : (hit._source.Body || "").substring(0, 300);
+
+                return `
+                    <div class="result-card">
+                        <div class="result-title">${title}</div>
+                        <div class="snippet">... ${content} ...</div>
+                    </div>
+                `;
+            }).join('');
+        } catch (error) {
+            status.innerText = "Connection Error. Check CORS settings.";
+            console.error(error);
+        }
+    }
+</script>
+
+</body>
+</html>

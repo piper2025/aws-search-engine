@@ -5,24 +5,17 @@ phases:
     runtime-versions:
       python: 3.10
     commands:
-      - echo "Installing dependencies for all three functions..."
-      # 1. Ingester / PDF Processing
+      - echo "Installing dependencies..."
       - pip install pypdf typing_extensions -t PDFtoTXT/
-      
-      # 2. Upload Logic (If separate from PDFtoTXT)
       - pip install requests requests_aws4auth -t Upload-to-search/
-      
-      # 3. Search Portal Logic
-      - pip install requests requests_aws4auth -t Search-Function/
       
   build:
     commands:
-      - echo "Packaging infrastructure for all functions..."
-      # This command zips all folders and prepares the CloudFormation template
+      - echo "Packaging infrastructure..."
+      # UPDATED: Pointing to the new 'template.yaml' in the root
       - aws cloudformation package --template-file template.yaml --s3-bucket search-artifacts-store --output-template-file lambdaoutput.yaml
       
   post_build:
     commands:
-      - echo "Deploying full stack..."
-      # Deploys the combined stack containing all three Lambdas
+      - echo "Deploying..."
       - aws cloudformation deploy --template-file lambdaoutput.yaml --stack-name pdf-automation-v1 --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM --no-fail-on-empty-changeset
