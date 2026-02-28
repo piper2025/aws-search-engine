@@ -10,7 +10,7 @@ Resources:
       FunctionName: PDFToText-Automated
       Handler: lambda_function.lambda_handler
       Runtime: python3.10
-      CodeUri: .
+      CodeUri: PDFtoTXT/
       MemorySize: 512
       Timeout: 900
       Role: 'arn:aws:iam::779803046124:role/lambda_s3'
@@ -25,7 +25,7 @@ Resources:
       FunctionName: upload-to-search
       Handler: lambda_function.lambda_handler
       Runtime: python3.10
-      CodeUri: .
+      CodeUri: Upload-to-search/
       MemorySize: 512
       Timeout: 900
       Role: 'arn:aws:iam::779803046124:role/lambda_s3'
@@ -37,10 +37,10 @@ Resources:
       FunctionName: search-portal-function
       Handler: lambda_function.lambda_handler
       Runtime: python3.10
-      CodeUri: .
+      CodeUri: Search-Function/
       MemorySize: 256
       Timeout: 30
-      Role: 'arn:aws:iam::779803046124:role/lambda_s3' # Ensure this role has OpenSearch search permissions
+      Role: 'arn:aws:iam::779803046124:role/lambda_s3'
       Environment:
         Variables:
           OS_INDEX: "lambda-index"
